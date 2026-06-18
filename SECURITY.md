@@ -1,4 +1,9 @@
 # Security Policy
+
 ## Reporting a Vulnerability
-Report privately via https://github.com/coderbuzz/codex/security/advisories
-Please do NOT disclose publicly until addressed.
+
+If you discover a security vulnerability, please report it privately via this
+repository's security advisory feature.
+
+Please do NOT disclose the vulnerability publicly until it has been addressed.
+
