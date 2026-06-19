@@ -1,11 +1,11 @@
-<!-- docs: sync from coderbuzz/codex@6f70be3 -->
+<!-- docs: sync from coderbuzz/codex@4dfdb6b -->
 
 # KVS — AI Agent Knowledge File
 
-**Package:** `@coderbuzz/kvs` v0.1.7\
-**Purpose:** Lightweight SQLite-backed key-value server with HTTP REST API,
-WebSocket RPC, atomic transactions, TTL, persistent queue, real-time watch, and
-push-based queue listeners.\
+**Package:** `@coderbuzz/kvs` v0.2.4\
+**Purpose:** Lightweight SQLite-backed key-value store. Embeddable `KVStore` with
+atomic transactions, TTL, persistent queue, real-time watch, and push-based queue
+listeners. Pair with `@coderbuzz/kvs-rest` for HTTP/WebSocket server.\
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`). No source
 `.ts` files in the package.
 
@@ -13,15 +13,16 @@ push-based queue listeners.\
 
 ## Mental Model
 
-KVS has two sides:
+KVS has a `KVStore` engine backed by SQLite, and a `KvsClient` SDK for
+communicating with a KVS server.
 
-- **Server** — a standalone process (`dist/index.js`) backed by SQLite. Exposes
-  HTTP REST + WebSocket endpoints. Run it with
-  `ACCESS_TOKEN=secret bun run
-  node_modules/@coderbuzz/kvs/dist/index.js`.
-- **Client** — `KvsClient` is a fetch-based TypeScript SDK. After `open()` it
-  transparently upgrades to WebSocket JSON-RPC for lower latency. Same API over
-  both transports.
+- **KVStore** — embed directly in your app. Create with `new KVStore("path.db")`.
+  All KV, atomic, queue, watch operations are available synchronously.
+- **KvsClient** — fetch-based TypeScript SDK for the HTTP/WebSocket server
+  (provided by `@coderbuzz/kvs-rest`). After `open()` it transparently upgrades
+  to WebSocket JSON-RPC for lower latency.
+- **Server** — use `@coderbuzz/kvs-rest` to wrap `KVStore` into an HTTP/WebSocket
+  server via `createServer(store, options)`.
 
 ```
 KvsClient
@@ -49,11 +50,12 @@ import {
   type KvListSelector,
   type KvMutation,
   KvsClient,
-  // Types
   type KvsClientOptions,
+  KVStore,
+  AtomicOperation,
+  Singleflight,
   type QueueMessage,
   type QueueOptions,
-  Singleflight,
 } from "@coderbuzz/kvs";
 ```
 
@@ -353,71 +355,26 @@ await kv.reset(); // DELETE all kv + queue data (testing only)
 
 ---
 
-## Server Internals (read-only context)
+## Server (via @coderbuzz/kvs-rest)
 
-- **SQLite** with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`
-- **TTL cleanup** every 60 seconds
-- **Failed message requeue** every 60 seconds (requeues `processing` messages
-  older than 30 s that have remaining attempts)
-- **List max** hard-capped at 1000 per page
+The HTTP/WebSocket server is in `@coderbuzz/kvs-rest`. Create a `KVStore`
+instance and pass it to `createServer()`. See that package for endpoint docs.
 
----
+```ts
+import { KVStore } from "@coderbuzz/kvs";
+import { createServer } from "@coderbuzz/kvs-rest";
 
-## HTTP API — Method Summary
-
-All endpoints require `Authorization: Bearer <TOKEN>` (except `/health`).
-Request body is JSON; response body is JSON.
-
-| Endpoint              | Body Fields                                                  | Response                                   |
-| --------------------- | ------------------------------------------------------------ | ------------------------------------------ |
-| `GET /health`         | —                                                            | `{ ok: true, uptime: number }`             |
-| `POST /kv/get`        | `key`                                                        | `{ entry: KvEntry \| null }`               |
-| `POST /kv/set`        | `key`, `value`, `ttl?`                                       | `{ ok: true, version }`                    |
-| `POST /kv/delete`     | `key`                                                        | `{ ok: true }`                             |
-| `POST /kv/list`       | `prefix?`, `start?`, `end?`, `limit?`, `cursor?`, `reverse?` | `{ entries, cursor }`                      |
-| `POST /kv/atomic`     | `checks?`, `mutations?`, `enqueues?`                         | `{ ok: true, version }` or `{ ok: false }` |
-| `POST /queue/enqueue` | `payload`, `topic?`, `delay?`, `maxAttempts?`                | `{ ok: true, id }`                         |
-| `POST /queue/dequeue` | `topic?`, `limit?`                                           | `{ messages: QueueMessage[] }`             |
-| `POST /queue/ack`     | `id`                                                         | `{ ok: boolean }`                          |
-| `POST /kv/reset`      | —                                                            | `{ ok: true }`                             |
-
----
-
-## WebSocket Protocol Summary
-
-Endpoint: `ws://host/ws` (or with `?token=TOKEN`)
-
-```json
-// Client → Server (RPC request)
-{ "id": 1, "method": "/kv/get", "params": { "key": ["users", "alice"] } }
-
-// Server → Client (RPC response)
-{ "id": 1, "result": { "entry": { ... } } }
-{ "id": 1, "error": "error message" }
-
-// Client → Server (watch)
-{ "id": 2, "method": "/kv/watch", "params": { "keys": [["config", "a"]] } }
-
-// Client → Server (unwatch)
-{ "method": "/kv/unwatch" }
-
-// Server → Client (watch push)
-{ "type": "watch", "entries": [{ "key": ..., "value": ..., "version": 1 }] }
-
-// Client → Server (queue listen)
-{ "id": 3, "method": "/queue/listen", "params": { "topic": "emails" } }
-
-// Server → Client (queue push)
-{ "type": "queue", "topic": "emails", "message": { "id": 42, ... } }
-
-// Auth (must be first message if token not in URL)
-{ "id": 0, "method": "auth", "params": { "token": "your-secret" } }
-// → { "id": 0, "result": { "ok": true } }
+const store = new KVStore("kv.db");
+const server = createServer(store, { port: 3000, accessToken: "secret" });
+await server.run();
 ```
 
-Supported RPC methods (same paths as HTTP): `/kv/get`, `/kv/set`, `/kv/delete`,
-`/kv/list`, `/kv/atomic`, `/queue/enqueue`, `/queue/dequeue`, `/queue/ack`,
-`/kv/reset`, `/kv/watch`, `/kv/unwatch`, `/queue/listen`, `/queue/unlisten`.
+### SQLite config (used by KVStore)
+
+- WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`
+- TTL cleanup every 60 seconds
+- Failed message requeue every 60 seconds (older than 30 s)
+- List max hard-capped at 1000 per page
 
 ---
 

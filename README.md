@@ -1,11 +1,11 @@
-<!-- docs: sync from coderbuzz/codex@6f70be3 -->
+<!-- docs: sync from coderbuzz/codex@4dfdb6b -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
-> **Self-hosted KV store for serverless and edge workloads.** SQLite-backed. HTTP API. TypeScript SDK. Drops in anywhere Redis or Upstash would go — without the infrastructure cost.
+> **Lightweight SQLite-backed key-value store.** Atomic transactions, TTL expiry, persistent queue, real-time watch. Embed directly in your app or pair with `@coderbuzz/kvs-rest` for an HTTP server.
 > AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs/blob/main/AI_KNOWLEDGE.md) for expert context.
 
-KVS is a lightweight, self-hosted key-value server designed for applications that need a simple, reliable KV store with atomic transactions, TTL expiry, persistent queues, real-time watch, and push-based listeners. Powered by SQLite (WAL mode), wrapped in a clean HTTP/WebSocket API, and controlled by a fully typed TypeScript client SDK.
+KVS is a lightweight, embeddable key-value store powered by SQLite (WAL mode). Use it directly in your code, or wrap it with `@coderbuzz/kvs-rest` for a full HTTP/WebSocket server. The `KvsClient` SDK talks to the server over REST and WebSocket RPC.
 
 ---
 
@@ -58,38 +58,24 @@ import { KvsClient } from "npm:@coderbuzz/kvs";
 
 ---
 
-## Self-Hosting the KVS Server
+## Running as a Server
 
-KVS is a standalone HTTP server that stores all data in a local SQLite file (WAL mode, 64 MB cache, 256 MB mmap) and exposes a REST API plus a WebSocket endpoint.
-
-### Requirements
-
-- **Bun** (recommended) or Node.js 18+
-- An `ACCESS_TOKEN` environment variable to protect the API
-
-### Run with Bun
+KVS is a library — embed it directly. For a standalone HTTP/WebSocket server, use `@coderbuzz/kvs-rest`:
 
 ```sh
-ACCESS_TOKEN=your-secret bun run node_modules/@coderbuzz/kvs/dist/index.js
+npm install @coderbuzz/kvs @coderbuzz/kvs-rest
 ```
 
-Or via package.json:
+```ts
+import { KVStore } from "@coderbuzz/kvs";
+import { createServer } from "@coderbuzz/kvs-rest";
 
-```json
-{
-  "scripts": {
-    "kvs": "ACCESS_TOKEN=your-secret bun run node_modules/@coderbuzz/kvs/dist/index.js"
-  }
-}
+const store = new KVStore("kv.db");
+const server = createServer(store, { port: 3000, accessToken: "your-secret" });
+await server.run();
 ```
 
-### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `ACCESS_TOKEN` | required | Bearer token required for all KV/queue endpoints |
-| `PORT` | `3000` | Port the server listens on |
-| `KV_DB_PATH` | `kv.db` | Path to the SQLite database file |
+See [@coderbuzz/kvs-rest documentation](https://github.com/coderbuzz/kvs-rest) for details.
 
 ---
 
@@ -427,106 +413,11 @@ await kv.enqueue({ type: "resize-image", data: { url, width: 800 } }, {
 
 ---
 
-## HTTP API Reference
+## HTTP API & WebSocket
 
-All endpoints except `/health` require: `Authorization: Bearer <ACCESS_TOKEN>` and `Content-Type: application/json`
+The HTTP API and WebSocket protocol are provided by `@coderbuzz/kvs-rest`. See its [documentation](https://github.com/coderbuzz/kvs-rest) for the full API reference.
 
-### Health
-
-```sh
-GET /health
-curl http://localhost:3000/health
-# → { "ok": true, "uptime": 123.45 }
-```
-
-### KV Endpoints (all POST)
-
-#### Set `POST /kv/set`
-
-| Field | Type | Description |
-|---|---|---|
-| `key` | `array` | Hierarchical key parts |
-| `value` | `any` | Any JSON value |
-| `ttl` | `number` (optional) | Expiry in milliseconds |
-
-#### Get `POST /kv/get`
-
-| Field | Type | Description |
-|---|---|---|
-| `key` | `array` | Hierarchical key |
-
-#### Delete `POST /kv/delete`
-
-#### List `POST /kv/list`
-
-| Field | Type | Description |
-|---|---|---|
-| `prefix` | `array` (optional) | List all keys under this prefix |
-| `start` | `array` (optional) | Inclusive lower bound (use with `end`) |
-| `end` | `array` (optional) | Exclusive upper bound |
-| `limit` | `number` (optional) | Max results, default 100, max 1000 |
-| `cursor` | `string` (optional) | Pagination cursor |
-| `reverse` | `boolean` (optional) | Descending order |
-
-#### Atomic `POST /kv/atomic`
-
-| Field | Type | Description |
-|---|---|---|
-| `checks` | `array` (optional) | Version assertions: `{ key, version }` pairs |
-| `mutations` | `array` (optional) | `{ type: "set"\|"delete", key, value?, ttl? }` |
-| `enqueues` | `array` (optional) | `{ payload, options? }` queue entries |
-
-### Queue Endpoints
-
-#### Enqueue `POST /queue/enqueue`
-
-| Field | Type | Description |
-|---|---|---|
-| `payload` | `any` | Job data |
-| `topic` | `string` (optional) | Default: `"default"` |
-| `delay` | `number` (optional) | Delivery delay in ms |
-| `maxAttempts` | `number` (optional) | Max retry attempts, default: 3 |
-
-#### Dequeue `POST /queue/dequeue`
-
-| Field | Type | Description |
-|---|---|---|
-| `topic` | `string` (optional) | Default: `"default"` |
-| `limit` | `number` (optional) | Max messages, default: 1 |
-
-#### Acknowledge `POST /queue/ack`
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | `number` | Message ID from dequeue response |
-
-### WebSocket Endpoint
-
-```
-ws://localhost:3000/ws?token=your-secret
-```
-
-All RPC messages use JSON format:
-
-```json
-// Request
-{ "id": 1, "method": "/kv/get", "params": { "key": ["users", "alice"] } }
-
-// Response (success)
-{ "id": 1, "result": { "entry": { ... } } }
-
-// Response (error)
-{ "id": 1, "error": "some error message" }
-```
-
-Push messages:
-```json
-// Watch update
-{ "type": "watch", "entries": [{ "key": [...], "value": ..., "version": 1 }, null] }
-
-// Queue listen delivery
-{ "type": "queue", "topic": "emails", "message": { "id": 42, "payload": {...}, ... } }
-```
+`KvsClient` communicates with the server over REST and WebSocket RPC.
 
 ---
 
