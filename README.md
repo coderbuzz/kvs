@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@4ebe72b -->
+<!-- docs: sync from coderbuzz/codex@54cd4a7 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -26,7 +26,7 @@ KVS is an embeddable key-value store powered by SQLite (WAL mode). Use it direct
 
 Full results at **[github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks)**.
 
-SQLite-backed KV store on Apple M-series, Bun runtime (`oha -c 100 -z 10s`):
+SQLite-backed KV store on Apple M-series, Bun runtime (direct throughput measurement):
 
 | Operation | Ops/s |
 |---|---|
