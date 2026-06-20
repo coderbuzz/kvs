@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@bd2db2c -->
+<!-- docs: sync from coderbuzz/codex@febf805 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -32,18 +32,6 @@ KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **P
 ## Benchmarks
 
 Full results at **[github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks)**.
-
-SQLite-backed KV store on Apple M-series, Bun runtime (direct throughput measurement):
-
-| Operation | Ops/s |
-|---|---|
-| `set('k', 'v')` | **198,720 ops/s** |
-| `get()` — cache hit | **1,156,635 ops/s** |
-| `get()` — cache miss | **1,931,481 ops/s** |
-| `delete()` | **1,689,546 ops/s** |
-| `increment()` | **138,163 ops/s** |
-
-KVS is powered by SQLite WAL mode — read performance is exceptional (1.2M hits, 1.9M misses per second), while writes are bounded by SQLite commit speed (~200K ops/s). All operations are **winner** benchmarks with no comparable competitor at this speed for an embeddable KV store.
 
 ### Async KV Throughput (SQLite sync/async + PostgreSQL async)
 
