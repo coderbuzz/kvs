@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@796aac1 -->
+<!-- docs: sync from coderbuzz/codex@cd4a13b -->
 
 # KVS — AI Agent Knowledge File
 
