@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@7af404c -->
+<!-- docs: sync from coderbuzz/codex@bd2db2c -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -18,7 +18,7 @@ KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **P
 ## Why KVS?
 
 | Need | KVS | Redis | Upstash |
-|---|---|---|---|---|
+|---|---|---|---|
 | Infrastructure | SQLite file or PostgreSQL | Server required | Managed |
 | Embeddable | Yes — just `new KVStore()` | No (separate process) | No |
 | Backends | SQLite (sync), SQLite + PostgreSQL (async) | - | - |
