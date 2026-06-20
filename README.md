@@ -1,9 +1,15 @@
-<!-- docs: sync from coderbuzz/codex@cd4a13b -->
+<!-- docs: sync from coderbuzz/codex@46af4b9 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
 > **Lightweight SQLite-backed key-value store for TypeScript.** Atomic transactions, TTL expiry, persistent queue, real-time watch. Embed directly in your app.
 > AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs/blob/main/AI_KNOWLEDGE.md) for expert context.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@coderbuzz/kvs"><img src="https://img.shields.io/npm/v/@coderbuzz/kvs.svg?style=flat-square" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@coderbuzz/kvs"><img src="https://img.shields.io/npm/dm/@coderbuzz/kvs.svg?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://github.com/coderbuzz/kvs/blob/main/LICENSE"><img src="https://img.shields.io/github/license/coderbuzz/kvs.svg?style=flat-square" alt="MIT License" /></a>
+  <a href="https://github.com/coderbuzz/kvs"><img src="https://img.shields.io/github/stars/coderbuzz/kvs.svg?style=flat-square" alt="GitHub Stars" /></a>
+</p>
 
 KVS is an embeddable key-value store powered by SQLite (WAL mode). Use it directly in your code — no HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
 
