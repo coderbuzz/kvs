@@ -10,4 +10,3 @@ Thank you for your interest in contributing!
 ## Code of Conduct
 
 Be respectful and constructive. We aim to foster an inclusive community.
-
