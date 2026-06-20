@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@54cd4a7 -->
+<!-- docs: sync from coderbuzz/codex@796aac1 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -30,13 +30,13 @@ SQLite-backed KV store on Apple M-series, Bun runtime (direct throughput measure
 
 | Operation | Ops/s |
 |---|---|
-| `set('k', 'v')` | **218,575 ops/s** |
-| `get()` — cache hit | **1,293,833 ops/s** |
-| `get()` — cache miss | **2,212,557 ops/s** |
-| `delete()` | **1,892,127 ops/s** |
-| `increment()` | **170,802 ops/s** |
+| `set('k', 'v')` | **198,720 ops/s** |
+| `get()` — cache hit | **1,156,635 ops/s** |
+| `get()` — cache miss | **1,931,481 ops/s** |
+| `delete()` | **1,689,546 ops/s** |
+| `increment()` | **138,163 ops/s** |
 
-KVS is powered by SQLite WAL mode — read performance is exceptional (1.3M hits, 2.2M misses per second), while writes are bounded by SQLite commit speed (~200K ops/s). All operations are **winner** benchmarks with no comparable competitor at this speed for an embeddable KV store.
+KVS is powered by SQLite WAL mode — read performance is exceptional (1.2M hits, 1.9M misses per second), while writes are bounded by SQLite commit speed (~200K ops/s). All operations are **winner** benchmarks with no comparable competitor at this speed for an embeddable KV store.
 
 ---
 
