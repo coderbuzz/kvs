@@ -1,8 +1,8 @@
-<!-- docs: sync from coderbuzz/codex@46af4b9 -->
+<!-- docs: sync from coderbuzz/codex@5f93304 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
-> **Lightweight SQLite-backed key-value store for TypeScript.** Atomic transactions, TTL expiry, persistent queue, real-time watch. Embed directly in your app.
+> **Multi-backend key-value store for TypeScript.** Synchronous SQLite, asynchronous SQLite, and PostgreSQL. Atomic transactions, TTL expiry, persistent queue, real-time watch.
 > AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs/blob/main/AI_KNOWLEDGE.md) for expert context.
 <p align="center">
   <a href="https://www.npmjs.com/package/@coderbuzz/kvs"><img src="https://img.shields.io/npm/v/@coderbuzz/kvs.svg?style=flat-square" alt="npm version" /></a>
@@ -11,17 +11,18 @@
   <a href="https://github.com/coderbuzz/kvs"><img src="https://img.shields.io/github/stars/coderbuzz/kvs.svg?style=flat-square" alt="GitHub Stars" /></a>
 </p>
 
-KVS is an embeddable key-value store powered by SQLite (WAL mode). Use it directly in your code — no HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
+KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **PostgreSQL** (async). Use it directly in your code — no HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
 
 ---
 
 ## Why KVS?
 
 | Need | KVS | Redis | Upstash |
-|---|---|---|---|
-| Infrastructure | SQLite file | Server required | Managed |
+|---|---|---|---|---|
+| Infrastructure | SQLite file or PostgreSQL | Server required | Managed |
 | Embeddable | Yes — just `new KVStore()` | No (separate process) | No |
-| Bundle size | ~30 KB | ~1 MB (ioredis) | N/A |
+| Backends | SQLite (sync), SQLite + PostgreSQL (async) | - | - |
+| Bundle size | ~30 KB (SQLite) / ~no extra (PG) | ~1 MB (ioredis) | N/A |
 | Transactions | Version-based checks + atomic commit | MULTI/EXEC/WATCH | Conditional checks |
 | Queue | Built-in with retries | Redis lists + pub/sub | Add-on |
 | Watch | Push-based (via server) | Keyspace notifications | Polling |
@@ -55,7 +56,8 @@ KVS is powered by SQLite WAL mode — read performance is exceptional (1.2M hits
 - **Built-in queue** — delayed delivery, retries, work-stealing listeners
 - **Real-time watch** — subscribe to key changes (requires `@coderbuzz/kvs-server`)
 - **getAsync** — cache-with-compute with singleflight deduplication
-- **Zero dependencies** — no external libs beyond bun:sqlite
+- **Multi-backend** — SQLite (sync), SQLite + PostgreSQL (async) via unified `AsyncKVStore`
+- **Zero dependencies** — no external libs beyond bun:sqlite / bun:sql
 
 ---
 
@@ -65,26 +67,29 @@ KVS is powered by SQLite WAL mode — read performance is exceptional (1.2M hits
 npm install @coderbuzz/kvs
 ```
 
-Requires **Bun** (for `bun:sqlite`).
+**KVStore** requires Bun (for `bun:sqlite`). **AsyncKVStore** uses `bun:sql` (built-in, no extra deps) and works with SQLite or PostgreSQL.
 
 ---
 
 ## Quick Start
 
 ```ts
-import { KVStore } from "@coderbuzz/kvs";
+import { KVStore, AsyncKVStore } from "@coderbuzz/kvs";
 
+// Sync (SQLite via bun:sqlite)
 const store = new KVStore("kv.db");
+store.set(["users", "alice"], { name: "Alice" });
+console.log(store.get(["users", "alice"])?.value);
 
-// Basic CRUD
-store.set(["users", "alice"], { name: "Alice", plan: "pro" });
-const entry = store.get(["users", "alice"]);
-console.log(entry?.value, entry?.version); // { name: "Alice", plan: "pro" }, 1
+// Async (SQLite via bun:sql)
+const asyncStore = new AsyncKVStore("sqlite://kv.db");
+await asyncStore.set(["users", "alice"], { name: "Alice" });
+console.log(await asyncStore.get(["users", "alice"]));
 
-store.delete(["users", "alice"]);
-
-// With TTL
-store.set(["cache", "hot-key"], computedValue, { ttl: 60_000 });
+// Async (PostgreSQL)
+const pgStore = new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
+await pgStore.set(["key"], "value");
+await pgStore.delete(["key"]);
 ```
 
 ---
@@ -265,6 +270,92 @@ Close database, stop cleanup/dispatch timers, cancel watchers/listeners.
 
 ---
 
+## AsyncKVStore API
+
+### `new AsyncKVStore(connection: string | { adapter: SqlAdapter })`
+
+Creates an async KV store backed by SQLite or PostgreSQL. Adapter auto-detected from connection string:
+
+```ts
+// SQLite file
+new AsyncKVStore("sqlite://kv.db");
+// SQLite in-memory
+new AsyncKVStore(":memory:");
+// PostgreSQL
+new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
+// Pre-built adapter
+new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...") });
+```
+
+**Connection string rules:**
+- `sqlite://...`, `file://...`, `:memory:`, or plain filename → SQLite
+- `postgres://...` or `postgresql://...` → PostgreSQL
+
+### Methods
+
+All methods return `Promise<T>` (same signatures as `KVStore` but async):
+
+```ts
+await store.get(key);             // Promise<KvEntry | null>
+await store.set(key, val, opts?); // Promise<KvCommitResult>
+await store.delete(key);          // Promise<void>
+await store.list(sel, opts?);     // Promise<KvListResult>
+await store.increment(key, n?);   // Promise<number>
+await store.enqueue(payload, opts?); // Promise<{ ok, id }>
+await store.dequeue(topic?, n?);  // Promise<QueueMessage[]>
+await store.acknowledge(id);      // Promise<boolean>
+await store.cleanExpired();       // Promise<number>
+await store.reset();              // Promise<void>
+await store.close();              // Promise<void>
+await store.getAsync(key, fn, ttl?); // Promise<T> (already async)
+```
+
+`watch()` and `addQueueListener()` remain sync (in-process callbacks).
+
+### `atomic(): AsyncAtomicOperation`
+
+Same fluent builder as `AtomicOperation` but `commit()` is async:
+
+```ts
+const result = await store
+  .atomic()
+  .check({ key: ["counter"], version: 3 })
+  .set(["counter"], 4)
+  .enqueue({ task: "notify" }, { topic: "jobs" })
+  .commit();
+```
+
+---
+
+## Adapters
+
+The `AsyncKVStore` uses an internal `SqlAdapter` interface. You can build custom adapters or use the built-in ones:
+
+| Adapter | Class | Backend |
+|---|---|---|
+| SQLite | `SQLiteAsyncAdapter` | SQLite via `bun:sql` |
+| PostgreSQL | `PostgresAdapter` | PostgreSQL via `bun:sql` |
+
+```ts
+import { PostgresAdapter } from "@coderbuzz/kvs";
+
+const adapter = new PostgresAdapter("postgres://user:pass@localhost:5432/kvdb");
+const store = new AsyncKVStore({ adapter });
+```
+
+### SQL Dialect Differences
+
+| Feature | SQLite | PostgreSQL |
+|---|---|---|
+| Key column | `BLOB` | `BYTEA` |
+| Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
+| Timestamp | `INTEGER` | `BIGINT` |
+| Increment cast | `CAST(value AS TEXT) AS REAL` | `convert_from(value, 'UTF8')::FLOAT8` |
+| Concurrent dequeue | Subquery `IN (SELECT ... LIMIT ?)` | `FOR UPDATE SKIP LOCKED` |
+| Partial indexes | `WHERE expires_at IS NOT NULL` | same |
+
+---
+
 ## Types
 
 ```ts
@@ -317,7 +408,9 @@ sf.clear();
 
 ## Server & Client
 
-- **Server**: `@coderbuzz/kvs-server` wraps `KVStore` into HTTP REST + WebSocket server
+- **Server**: `@coderbuzz/kvs-server` wraps `KVStore` (sync) or `AsyncKVStore` (async) into HTTP REST + WebSocket server
+  - `createServer(store, opts)` for sync `KVStore`
+  - `createAsyncServer(store, opts)` for async `AsyncKVStore`
 - **Client**: `@coderbuzz/kvs-client` is the TypeScript SDK for the server
 
 ---
