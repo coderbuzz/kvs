@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@5f93304 -->
+<!-- docs: sync from coderbuzz/codex@7af404c -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -44,6 +44,16 @@ SQLite-backed KV store on Apple M-series, Bun runtime (direct throughput measure
 | `increment()` | **138,163 ops/s** |
 
 KVS is powered by SQLite WAL mode — read performance is exceptional (1.2M hits, 1.9M misses per second), while writes are bounded by SQLite commit speed (~200K ops/s). All operations are **winner** benchmarks with no comparable competitor at this speed for an embeddable KV store.
+
+### Async KV Throughput (SQLite sync/async + PostgreSQL async)
+
+| Backend | set('k','v') | get() hit | get() miss | delete() | increment() |
+|---|---|---|---|---|---|
+| Sync SQLite | **205,747 ops/s** | **1,241,691 ops/s** | **2,140,495 ops/s** | **1,786,171 ops/s** | **162,501 ops/s** |
+| Async SQLite | 65,001 ops/s | 140,799 ops/s | 155,489 ops/s | 270,737 ops/s | 43,183 ops/s |
+| Async PostgreSQL | 1,621 ops/s | 9,206 ops/s | 8,491 ops/s | 10,495 ops/s | 1,621 ops/s |
+
+Sync SQLite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2-4x overhead per operation due to `await` + `bun:sql` abstraction. PostgreSQL adds network round-trip overhead (~10-50x vs SQLite) but enables multi-process concurrency, horizontal scaling, and shared access.
 
 ---
 

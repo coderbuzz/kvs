@@ -1,8 +1,8 @@
-<!-- docs: sync from coderbuzz/codex@5f93304 -->
+<!-- docs: sync from coderbuzz/codex@7af404c -->
 
 # KVS — AI Agent Knowledge File
 
-**Package:** `@coderbuzz/kvs` v0.2.10
+**Package:** `@coderbuzz/kvs` v0.2.11
 **Purpose:** Multi-backend key-value store. Sync `KVStore` (bun:sqlite) and async `AsyncKVStore` (bun:sql — SQLite + PostgreSQL).
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 
