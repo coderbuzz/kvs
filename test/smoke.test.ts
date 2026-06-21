@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { KVStore, encodeKey, decodeKey } from "@coderbuzz/kvs";
+import { KVStore, encodeKey, decodeKey } from "../src/index";
 
 test("KVStore set/get", () => {
   const store = new KVStore();
