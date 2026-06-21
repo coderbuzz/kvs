@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@8261409 -->
+<!-- docs: sync from coderbuzz/codex@e5210d1 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -9,6 +9,8 @@
   <a href="https://www.npmjs.com/package/@coderbuzz/kvs"><img src="https://img.shields.io/npm/dm/@coderbuzz/kvs.svg?style=flat-square" alt="npm downloads" /></a>
   <a href="https://github.com/coderbuzz/kvs/blob/main/LICENSE"><img src="https://img.shields.io/github/license/coderbuzz/kvs.svg?style=flat-square" alt="MIT License" /></a>
   <a href="https://github.com/coderbuzz/kvs"><img src="https://img.shields.io/github/stars/coderbuzz/kvs.svg?style=flat-square" alt="GitHub Stars" /></a>
+  <a href="https://github.com/coderbuzz/codex/actions/workflows/ci.kvs.yml"><img src="https://github.com/coderbuzz/codex/actions/workflows/ci.kvs.yml/badge.svg" alt="CI" /></a>
+  <a href="https://codecov.io/gh/coderbuzz/codex"><img src="https://codecov.io/gh/coderbuzz/codex/graph/badge.svg?flag=kvs" alt="Codecov" /></a>
 </p>
 
 KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **PostgreSQL** (async). Use it directly in your code — no HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
