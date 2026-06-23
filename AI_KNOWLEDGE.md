@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@4b7f24c -->
+<!-- docs: sync from coderbuzz/codex@c0ec729 -->
 
 # KVS — AI Agent Knowledge File
 
@@ -59,7 +59,7 @@ import {
   openDatabase, StmtCache,
   SQLiteAsyncAdapter, PostgresAdapter,             // adapters
   type SqlAdapter,
-  encodeKey, decodeKey,
+  encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor,
   type KvKey, type KvKeyPart, type KvEntry,
   type KvCommitResult, type KvCommitError,
   type KvCheck, type KvMutation,
@@ -120,11 +120,20 @@ Sort: Uint8Array < string < number < bigint < false < true
 Encoding: each key part is prefixed with a type-tag byte + varint-length, then sorted lexicographically as bytes.
 
 ```ts
-import { encodeKey, decodeKey } from "@coderbuzz/kvs";
+import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbuzz/kvs";
 
 ["a"] < ["b"]
 ["users", 1] < ["users", 2]
 ["items", true] > ["items", false]
+
+// Round-trip: KvKey → bytes → KvKey
+const encoded = encodeKey(["users", "alice"]);
+const decoded = decodeKey(encoded); // ["users", "alice"]
+
+// Low-level prefix scan for custom range queries
+const prefix = encodeKeyPrefix(["events"]);
+const upper = prefixSuccessor(prefix);
+// Resulting range: key >= prefix AND key < upper
 ```
 
 ---
@@ -181,10 +190,20 @@ store.delete(["users", "alice"]);
 
 ### `increment(key: KvKey, delta?: number): number`
 
+Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist. Uses a single SQL UPDATE + RETURNING — no JSON parse/stringify overhead.
+
 ```ts
-store.increment(["counter", "visits"]);        // +1 (default)
-store.increment(["counter", "visits"], 5);      // +5
-store.increment(["counter", "visits"], -1);     // -1
+// Basic increment (default delta: 1)
+store.increment(["counter", "visits"]);        // 1 (first call)
+store.increment(["counter", "visits"]);        // 2
+
+// Custom delta — positive or negative
+store.increment(["counter", "visits"], 5);      // 7
+store.increment(["counter", "visits"], -1);     // 6
+
+// Rate limiting pattern
+const attempts = store.increment(["ratelimit", "192.168.1.1"], 1);
+if (attempts > 10) throw new Error("Rate limit exceeded");
 // Returns the new value after increment
 ```
 
@@ -256,9 +275,21 @@ store.enqueue(
 
 **Defaults:** `topic: "default"`, `limit: 1`.
 
+Dequeue messages ready for delivery. Messages are moved to `"processing"` status. Not acknowledging within 30s → auto-requeue (up to `maxAttempts`).
+
 ```ts
 const messages = store.dequeue("emails", 10);
-// Returns QueueMessage[] — messages moved to "processing" status
+
+// Worker loop — acknowledge on success, skip on failure
+for (const msg of messages) {
+  try {
+    await sendEmail(msg.payload);
+    store.acknowledge(msg.id);  // mark as done
+  } catch {
+    // Don't acknowledge — requeued after 30s (up to maxAttempts)
+    console.error(`Failed ${msg.id}, attempt ${msg.attempts + 1}/${msg.maxAttempts}`);
+  }
+}
 ```
 
 ### `acknowledge(id: number): boolean`
@@ -327,13 +358,38 @@ const ad = await store.getAsync(["ads", "venue", 42], () => fetchNextAd(42), 30_
 
 Manually delete expired entries. Returns count of deleted rows. (Auto-runs every 60s.)
 
+```ts
+store.set(["cache", "a"], "x", { ttl: 1_000 });
+store.set(["cache", "b"], "y", { ttl: 1_000 });
+// After 2s, entries are expired — cleanExpired() removes them immediately
+const deleted = store.cleanExpired(); // 2
+```
+
 ### `reset(): void`
 
 Delete ALL data from `kv` and `queue` tables. Cancels all watchers and listeners.
 
+```ts
+store.set(["users", "alice"], { name: "Alice" });
+store.enqueue("test");
+store.reset();
+store.get(["users", "alice"]); // null
+```
+
 ### `close(): void`
 
-Close database, stop cleanup/dispatch timers, cancel all watchers/listeners.
+Close database, stop cleanup/dispatch timers, cancel all watchers/listeners. No operations work after close.
+
+```ts
+// Graceful shutdown handler
+process.on("SIGINT", () => {
+  store.close();
+  process.exit(0);
+});
+
+// Or in a web framework
+server.on("close", () => store.close());
+```
 
 ---
 

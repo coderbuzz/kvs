@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@4b7f24c -->
+<!-- docs: sync from coderbuzz/codex@c0ec729 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -129,6 +129,24 @@ Every `set` increments `version` by 1.
 store.delete(["users", "alice"]);
 ```
 
+### `increment(key: KvKey, delta?: number): number`
+
+Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist. Default `delta: 1`.
+
+```ts
+// Basic increment
+store.increment(["counters", "pageviews"]); // 1 (first call)
+store.increment(["counters", "pageviews"]); // 2
+
+// Custom delta (decrement with negative)
+store.increment(["users", "alice", "balance"], 500);  // 500
+store.increment(["users", "alice", "balance"], -100); // 400
+
+// Rate limiting pattern
+const attempts = store.increment(["ratelimit", ip], 1);
+if (attempts > 10) throw new Error("Rate limit exceeded");
+```
+
 ### `list(selector: KvListSelector, options?: KvListOptions): KvListResult`
 
 ```ts
@@ -208,12 +226,21 @@ Defaults: `topic: "default"`, `delay: 0`, `maxAttempts: 3`.
 
 ### `dequeue(topic?: string, limit?: number): QueueMessage[]`
 
+Dequeue messages ready for delivery. Messages move to `"processing"` status. Not acknowledged within 30s → auto-requeued (up to `maxAttempts`).
+
 ```ts
 const messages = store.dequeue("emails", 10);
-// Each message: { id, topic, payload, enqueuedAt, deliverAt, attempts, maxAttempts }
-```
 
-Moves messages to `"processing"` status.
+// Process in a loop — acknowledge on success, skip on failure
+for (const msg of messages) {
+  try {
+    await sendEmail(msg.payload);
+    store.acknowledge(msg.id); // mark as done
+  } catch {
+    // Don't acknowledge — auto-requeued after 30s (up to maxAttempts)
+  }
+}
+```
 
 ### `acknowledge(id: number): boolean`
 
@@ -256,19 +283,41 @@ const { cancel } = store.addQueueListener("emails", (msg) => {
 cancel();
 ```
 
-Dispatcher runs every 1 s, pushing to one listener per message.
+Dispatch timer runs every 1 s (messages aren't instant). Messages distributed round-robin across all listeners on the same topic — each message goes to exactly one listener.
 
 ### `cleanExpired(): number`
 
-Manually trigger cleanup of expired entries. Returns number of deleted rows.
+Manually trigger cleanup of expired entries. Auto-runs every 60s. Returns number of deleted rows.
+
+```ts
+store.set(["cache", "a"], "x", { ttl: 1000 });
+store.set(["cache", "b"], "y", { ttl: 1000 });
+// After 2s, entries are expired — cleanExpired() removes them immediately
+store.cleanExpired(); // returns 2
+```
 
 ### `reset(): void`
 
 Delete ALL data from kv + queue tables. Cancels all watchers.
 
+```ts
+store.set(["users", "alice"], { name: "Alice" });
+store.enqueue("test");
+store.reset();
+store.get(["users", "alice"]); // null
+```
+
 ### `close(): void`
 
-Close database, stop cleanup/dispatch timers, cancel watchers/listeners.
+Close database, stop cleanup/dispatch timers, cancel watchers/listeners. No operations work after close.
+
+```ts
+// Graceful shutdown
+process.on("SIGINT", () => {
+  store.close();
+  process.exit(0);
+});
+```
 
 ---
 
@@ -390,6 +439,23 @@ Uint8Array < string < number < bigint < false < true
 ["a"] < ["b"]
 ["users", 1] < ["users", 2]
 ["items", true] > ["items", false]
+```
+
+### Encoding Utilities
+
+Low-level functions for key serialization:
+
+```ts
+import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbuzz/kvs";
+
+// Round-trip: KvKey → bytes → KvKey
+const encoded = encodeKey(["users", "alice"]);
+const decoded = decodeKey(encoded); // ["users", "alice"]
+
+// Low-level prefix scan for custom range queries
+const prefix = encodeKeyPrefix(["events"]);
+const upper = prefixSuccessor(prefix);
+// Range: key >= prefix AND key < upper
 ```
 
 ---
