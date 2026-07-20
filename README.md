@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@8746dea -->
+<!-- docs: sync from coderbuzz/codex@34f92e9 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -259,17 +259,30 @@ pending → (dequeue) → processing → (acknowledge) → done
 
 ### `watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }`
 
-Subscribe to key changes. Fires immediately with current values:
+Subscribe to key changes. Fires immediately with current values. The optional
+second callback argument carries a process-local ordered sequence:
 
 ```ts
 const { cancel } = store.watch(
   [["config", "theme"], ["config", "lang"]],
-  (entries) => {
+  (entries, event) => {
     // entries[0] = KvEntry | null for ["config", "theme"]
+    console.log(event?.sequence, event?.initial, event?.changedKeys);
   },
 );
 cancel(); // stop watching
 ```
+
+One committed mutation batch invokes each matching watcher once. Committed
+entries are reused directly, and unchanged keys in multi-key watches are read at
+most once per batch regardless of subscriber count. Atomic commits changing
+multiple watched keys therefore produce one coherent callback.
+
+### `getWatchDiagnostics(): KvWatchDiagnostics`
+
+Returns bounded counters for active watchers, committed batches, callbacks,
+shared reads, callback errors, and dispatcher errors. It does not expose raw
+keys or values.
 
 ### `addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }`
 
@@ -287,7 +300,8 @@ Dispatch timer runs every 1 s (messages aren't instant). Messages distributed ro
 
 ### `cleanExpired(): number`
 
-Manually trigger cleanup of expired entries. Auto-runs every 60s. Returns number of deleted rows.
+Manually trigger cleanup of expired entries. Auto-runs every 60s. Returns number
+of deleted rows and emits `null` tombstones to active watchers.
 
 ```ts
 store.set(["cache", "a"], "x", { ttl: 1000 });
@@ -298,7 +312,8 @@ store.cleanExpired(); // returns 2
 
 ### `reset(): void`
 
-Delete ALL data from kv + queue tables. Cancels all watchers.
+Delete ALL data from kv + queue tables. Active watchers receive a reset
+tombstone and remain registered, so later writes continue to be delivered.
 
 ```ts
 store.set(["users", "alice"], { name: "Alice" });
@@ -414,6 +429,8 @@ import type {
   KvKey,           // KvKeyPart[]
   KvKeyPart,       // string | number | bigint | boolean | Uint8Array
   KvEntry,         // { key, value, version }
+  KvWatchEvent,    // { sequence, initial, changedKeys, coalesced?, reset? }
+  KvWatchDiagnostics,
   KvCommitResult,  // { ok: true, version }
   KvCommitError,   // { ok: false }
   KvCheck,         // { key, version }

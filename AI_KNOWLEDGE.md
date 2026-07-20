@@ -1,8 +1,8 @@
-<!-- docs: sync from coderbuzz/codex@8746dea -->
+<!-- docs: sync from coderbuzz/codex@34f92e9 -->
 
 # KVS — AI Agent Knowledge File
 
-**Package:** `@coderbuzz/kvs` v0.2.11
+**Package:** `@coderbuzz/kvs`
 **Purpose:** Multi-backend key-value store. Sync `KVStore` (bun:sqlite) and async `AsyncKVStore` (bun:sql — SQLite + PostgreSQL).
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 
@@ -104,7 +104,22 @@ interface QueueMessage {
 }
 interface QueueOptions { topic?: string; delay?: number; maxAttempts?: number }
 
-type WatchCallback = (entries: (KvEntry | null)[]) => void
+interface KvWatchEvent {
+  sequence: number       // monotonic only for the current store process
+  initial: boolean
+  changedKeys: KvKey[]
+  coalesced?: boolean
+  reset?: boolean
+}
+interface KvWatchDiagnostics {
+  activeWatchers: number
+  committedBatches: number
+  callbacks: number
+  sharedReads: number
+  callbackErrors: number
+  dispatchErrors: number
+}
+type WatchCallback = (entries: (KvEntry | null)[], event?: KvWatchEvent) => void
 ```
 
 ---
@@ -423,6 +438,7 @@ await store.getAsync<T>(key: KvKey, fn: () => T | Promise<T>, ttl?: number): Pro
 ```ts
 store.watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }
 store.addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }
+store.getWatchDiagnostics(): KvWatchDiagnostics
 ```
 
 ### `atomic(): AsyncAtomicOperation`
@@ -530,10 +546,24 @@ sf.size;           // number of in-flight keys
 
 ### Watch internals
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
-- On mutation (`set`/`delete`/`increment`/`atomic.commit`), `notifyWatchers()` fires all watchers for that key
-- Each watcher re-fetches ALL its watched keys' current values on every fire
-- Errors from individual watcher callbacks are silently caught (won't break other watchers)
-- `watch()` fires **immediately** with current values when first registered
+- Every successful mutation creates a committed mutation containing the encoded
+  key and immutable committed `KvEntry | null`; set/increment values are not
+  re-read from storage.
+- Atomic operations collapse repeated keys to their final state and emit one
+  batch after the transaction commits. A watcher matching multiple changed keys
+  is invoked once for that batch.
+- A batch-local entry cache is seeded by changed entries. Every unique unchanged
+  key required by legacy multi-key callbacks is fetched at most once, shared by
+  all matching watchers.
+- Sync callbacks run sequentially after commit. Async batches enter one ordered
+  promise chain; watchers are captured at enqueue time and checked for active
+  state before callback, preventing post-cancel sends and stale completion order.
+- `WatchCallback` is `(entries, event?) => void`. `event.sequence` is monotonic
+  only within the current process; it is not a durable database revision.
+- `watch()` fires immediately with `initial: true`. `cleanExpired()` emits
+  tombstones. `reset()` emits `reset: true` tombstones and keeps watchers active.
+- `getWatchDiagnostics()` returns active watcher, batch, callback, shared-read,
+  callback-error, and dispatch-error counters without high-cardinality labels.
 
 ### Queue dispatch internals
 - `queueListeners: Map<topic, Set<callback>>`
