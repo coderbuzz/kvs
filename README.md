@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@34f92e9 -->
+<!-- docs: sync from coderbuzz/codex@ba4a5ed -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -70,6 +70,8 @@ npm install @coderbuzz/kvs
 ```
 
 **KVStore** requires Bun (for `bun:sqlite`). **AsyncKVStore** uses `bun:sql` (built-in, no extra deps) and works with SQLite or PostgreSQL.
+
+**Engine minimums.** The queue picker uses `WITH ... AS MATERIALIZED`, which needs **PostgreSQL 12+** and **SQLite 3.35+**. Bun bundles SQLite 3.43, so the SQLite backends are always fine; only an older PostgreSQL server is a problem.
 
 ---
 
