@@ -1,9 +1,9 @@
-<!-- docs: sync from coderbuzz/codex@7d74651 -->
+<!-- docs: sync from coderbuzz/codex@200be78 -->
 
-# KVS — AI Agent Knowledge File
+# KVS: AI Agent Knowledge File
 
 **Package:** `@coderbuzz/kvs`
-**Purpose:** Multi-backend key-value store. Sync `KVStore` (bun:sqlite) and async `AsyncKVStore` (bun:sql — SQLite + PostgreSQL).
+**Purpose:** Multi-backend key-value store. Sync `KVStore` (bun:sqlite) and async `AsyncKVStore` (bun:sql, SQLite + PostgreSQL).
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 
 ---
@@ -11,22 +11,22 @@
 ## Mental Model
 
 ```
-KVStore("kv.db")                — sync, bun:sqlite, embedded SQLite only
-AsyncKVStore("sqlite://kv.db")  — async, bun:sql, SQLite
-AsyncKVStore("postgres://...")  — async, bun:sql, PostgreSQL
+KVStore("kv.db")                : sync, bun:sqlite, embedded SQLite only
+AsyncKVStore("sqlite://kv.db")  : async, bun:sql, SQLite
+AsyncKVStore("postgres://...")  : async, bun:sql, PostgreSQL
 ```
 
 ### KVStore (sync)
 ```
 KVStore("kv.db")
-  ├── get/set/delete          — CRUD (sync)
-  ├── increment               — atomic counter (sync)
-  ├── list                    — prefix/range queries (sync)
-  ├── atomic()                — version-checked transactions (sync)
-  ├── enqueue/dequeue/ack     — persistent queue (sync)
-  ├── watch()                 — in-process callbacks (sync)
-  ├── addQueueListener()      — push-based queue delivery (sync)
-  ├── getAsync()              — cache-with-compute (singleflight, async)
+  ├── get/set/delete          : CRUD (sync)
+  ├── increment               : atomic counter (sync)
+  ├── list                    : prefix/range queries (sync)
+  ├── atomic()                : version-checked transactions (sync)
+  ├── enqueue/dequeue/ack     : persistent queue (sync)
+  ├── watch()                 : in-process callbacks (sync)
+  ├── addQueueListener()      : push-based queue delivery (sync)
+  ├── getAsync()              : cache-with-compute (singleflight, async)
   ├── cleanExpired() / reset()
   └── close()
 ```
@@ -34,16 +34,16 @@ KVStore("kv.db")
 ### AsyncKVStore (async)
 ```
 AsyncKVStore("sqlite://kv.db" | "postgres://...")
-  ├── get/set/delete          — CRUD (async)
-  ├── increment               — atomic counter (async)
-  ├── list                    — prefix/range queries (async)
-  ├── atomic()                — version-checked transactions (async commit)
-  ├── enqueue/dequeue/ack     — persistent queue (async)
-  ├── watch()                 — same as KVStore (in-process)
-  ├── addQueueListener()      — same as KVStore
-  ├── getAsync()              — same as KVStore
-  ├── cleanExpired() / reset() — async
-  └── close()                 — async
+  ├── get/set/delete          : CRUD (async)
+  ├── increment               : atomic counter (async)
+  ├── list                    : prefix/range queries (async)
+  ├── atomic()                : version-checked transactions (async commit)
+  ├── enqueue/dequeue/ack     : persistent queue (async)
+  ├── watch()                 : same as KVStore (in-process)
+  ├── addQueueListener()      : same as KVStore
+  ├── getAsync()              : same as KVStore
+  ├── cleanExpired() / reset() : async
+  └── close()                 : async
 ```
 
 ---
@@ -205,14 +205,14 @@ store.delete(["users", "alice"]);
 
 ### `increment(key: KvKey, delta?: number): number`
 
-Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist. Uses a single SQL UPDATE + RETURNING — no JSON parse/stringify overhead.
+Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist. Uses a single SQL UPDATE + RETURNING, with no JSON parse/stringify overhead.
 
 ```ts
 // Basic increment (default delta: 1)
 store.increment(["counter", "visits"]);        // 1 (first call)
 store.increment(["counter", "visits"]);        // 2
 
-// Custom delta — positive or negative
+// Custom delta: positive or negative
 store.increment(["counter", "visits"], 5);      // 7
 store.increment(["counter", "visits"], -1);     // 6
 
@@ -260,7 +260,7 @@ const result = store
 if (result.ok) {
   console.log("Version:", result.version);
 } else {
-  console.log("Check failed — retry");
+  console.log("Check failed, retry");
 }
 ```
 
@@ -295,13 +295,13 @@ Dequeue messages ready for delivery. Messages are moved to `"processing"` status
 ```ts
 const messages = store.dequeue("emails", 10);
 
-// Worker loop — acknowledge on success, skip on failure
+// Worker loop: acknowledge on success, skip on failure
 for (const msg of messages) {
   try {
     await sendEmail(msg.payload);
     store.acknowledge(msg.id);  // mark as done
   } catch {
-    // Don't acknowledge — requeued after 30s (up to maxAttempts)
+    // Don't acknowledge, requeued after 30s (up to maxAttempts)
     console.error(`Failed ${msg.id}, attempt ${msg.attempts + 1}/${msg.maxAttempts}`);
   }
 }
@@ -355,15 +355,15 @@ cancel();
 
 ### `getAsync<T>(key: KvKey, fn: () => T | Promise<T>, ttl?: number): Promise<T>`
 
-Cache-with-compute with singleflight deduplication. Returns `Promise` — the only async method on `KVStore`.
+Cache-with-compute with singleflight deduplication. Returns `Promise`. It is the only async method on `KVStore`.
 
 ```ts
-// 100 concurrent callers — fn() runs once, result cached for 30s
+// 100 concurrent callers: fn() runs once, result cached for 30s
 const ad = await store.getAsync(["ads", "venue", 42], () => fetchNextAd(42), 30_000);
 ```
 
 **Algorithm:**
-1. Check SQLite — return immediately on cache hit
+1. Check SQLite: return immediately on cache hit
 2. Singleflight dedup within process (coalesce concurrent calls for same key)
 3. Call `fn()` exactly once
 4. Store result in SQLite with TTL (if provided)
@@ -376,7 +376,7 @@ Manually delete expired entries. Returns count of deleted rows. (Auto-runs every
 ```ts
 store.set(["cache", "a"], "x", { ttl: 1_000 });
 store.set(["cache", "b"], "y", { ttl: 1_000 });
-// After 2s, entries are expired — cleanExpired() removes them immediately
+// After 2s, entries are expired: cleanExpired() removes them immediately
 const deleted = store.cleanExpired(); // 2
 ```
 
@@ -454,7 +454,7 @@ const result = await store
   .commit();
 ```
 
-**AsyncAtomicOperation methods:** `check()`, `set()`, `delete()`, `enqueue()` — all return `this`. `commit(): Promise<KvCommitResult | KvCommitError>`.
+**AsyncAtomicOperation methods:** `check()`, `set()`, `delete()`, `enqueue()` all return `this`. `commit(): Promise<KvCommitResult | KvCommitError>`.
 
 ---
 
@@ -507,7 +507,7 @@ import { Singleflight } from "@coderbuzz/kvs";
 
 const sf = new Singleflight<User>();
 
-// 100 concurrent calls for "user:42" — fetchUser() runs once
+// 100 concurrent calls for "user:42": fetchUser() runs once
 const user = await sf.do("user:42", () => fetchUser(42));
 
 sf.clear();        // clear all in-flight
@@ -518,7 +518,7 @@ sf.size;           // number of in-flight keys
 
 ## Backend Config
 
-### SQLite (KVStore — sync, bun:sqlite)
+### SQLite (KVStore, sync, bun:sqlite)
 - WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`
 - TTL cleanup every 60 s
 - Failed message requeue every 60 s (older than 30 s, up to maxAttempts)
@@ -540,9 +540,9 @@ sf.size;           // number of in-flight keys
 ## Internal Behavior (important for debugging)
 
 ### Timers (started in constructor, stopped in close())
-- **TTL cleanup:** Every 60s — deletes rows where `expires_at <= now`
-- **Failed message requeue:** Every 60s — requeues messages where `deliver_at <= now` AND `attempts < maxAttempts` AND status is not "done" (older than 30s)
-- **Queue dispatch:** Every 1s — dispatches deliverable messages to active listeners (round-robin)
+- **TTL cleanup:** Every 60s, deletes rows where `expires_at <= now`
+- **Failed message requeue:** Every 60s, requeues messages where `deliver_at <= now` AND `attempts < maxAttempts` AND status is not "done" (older than 30s)
+- **Queue dispatch:** Every 1s, dispatches deliverable messages to active listeners (round-robin)
 
 ### Watch internals
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
@@ -567,7 +567,7 @@ sf.size;           // number of in-flight keys
 
 ### Queue dispatch internals
 - `queueListeners: Map<topic, Set<callback>>`
-- `queueRRIndex: Map<topic, number>` — round-robin index per topic
+- `queueRRIndex: Map<topic, number>`, the round-robin index per topic
 - `dispatchToListeners()`: dequeues messages one-by-one, distributes round-robin
 - Stops dispatch timer when all topics have no listeners
 
@@ -576,19 +576,19 @@ sf.size;           // number of in-flight keys
 ## Gotchas
 
 1. `KVStore.get()` returns `null` for expired entries (TTL respected).
-2. `AtomicOperation.check({ version: null })` means "key must NOT exist" — opposite of checking a version number.
+2. `AtomicOperation.check({ version: null })` means "key must NOT exist". This is the opposite of checking a version number.
 3. `watch()` fires immediately with current values, not just on future changes.
-4. `addQueueListener()` callbacks must call `acknowledge()` manually — messages are NOT auto-acked.
-5. `getAsync()` uses `JSON.stringify(key)` as the singleflight dedup key — same array in same order.
+4. `addQueueListener()` callbacks must call `acknowledge()` manually. Messages are NOT auto-acked.
+5. `getAsync()` uses `JSON.stringify(key)` as the singleflight dedup key: same array in same order.
 6. `KVStore` requires Bun (for `bun:sqlite`). `AsyncKVStore` uses `bun:sql` (built-in, no extra deps).
 7. `close()` stops all timers, cancels all watchers, and closes the database. No operations work after close.
 8. SQLite WAL means concurrent readers are fine, but writers are serialized.
 9. **Engine minimums:** the queue picker is a `WITH ... AS MATERIALIZED` CTE, which requires **PostgreSQL 12+** and **SQLite 3.35+**; `RETURNING` also requires SQLite 3.35+. Bun bundles SQLite 3.43, so only the PostgreSQL server version needs checking.
-10. **`dequeue(topic, limit)` returns at most `limit` rows, and ties in `deliver_at` break on `id ASC`.** Both are load-bearing. The picker must stay inside the materialized CTE: on PostgreSQL an equivalent `id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)` sublink can be planned on the inner side of a nested-loop semi join with no `Materialize` node, rescanning the picker once per outer row. Each rescan re-runs `SKIP LOCKED` against the rows the previous iteration locked, returns a different window, and every candidate row ends up marked `processing` — a whole backlog delivered to one worker while the call reports the limit it was given. `deliver_at` is a millisecond timestamp, so enqueue bursts tie constantly; without the `id` tiebreaker FIFO order is whatever the planner produces.
+10. **`dequeue(topic, limit)` returns at most `limit` rows, and ties in `deliver_at` break on `id ASC`.** Both are load-bearing. The picker must stay inside the materialized CTE: on PostgreSQL an equivalent `id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)` sublink can be planned on the inner side of a nested-loop semi join with no `Materialize` node, rescanning the picker once per outer row. Each rescan re-runs `SKIP LOCKED` against the rows the previous iteration locked, returns a different window, and every candidate row ends up marked `processing`. This delivers a whole backlog to one worker while the call reports the limit it was given. `deliver_at` is a millisecond timestamp, so enqueue bursts tie constantly; without the `id` tiebreaker FIFO order is whatever the planner produces.
 
 ---
 
 ## Server & Client
 
-- `@coderbuzz/kvs-server` — `createServer(store)` for sync, `createAsyncServer(store)` for async
-- `@coderbuzz/kvs-client` — TypeScript SDK for the server
+- `@coderbuzz/kvs-server`: `createServer(store)` for sync, `createAsyncServer(store)` for async
+- `@coderbuzz/kvs-client`: TypeScript SDK for the server

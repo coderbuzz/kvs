@@ -1,6 +1,6 @@
-<!-- docs: sync from coderbuzz/codex@7d74651 -->
+<!-- docs: sync from coderbuzz/codex@200be78 -->
 
-# KVS &mdash; `@coderbuzz/kvs`
+# KVS: `@coderbuzz/kvs`
 
 > **Multi-backend key-value store for TypeScript.** Synchronous SQLite, asynchronous SQLite, and PostgreSQL. Atomic transactions, TTL expiry, persistent queue, real-time watch.
 > AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs/blob/main/AI_KNOWLEDGE.md) for expert context.
@@ -13,7 +13,7 @@
   <a href="https://codecov.io/gh/coderbuzz/kvs"><img src="https://codecov.io/gh/coderbuzz/kvs/graph/badge.svg" alt="Codecov" /></a>
 </p>
 
-KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **PostgreSQL** (async). Use it directly in your code — no HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
+KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **PostgreSQL** (async). Use it directly in your code. No HTTP server required. Pair with `@coderbuzz/kvs-server` for HTTP/WS, or `@coderbuzz/kvs-client` for the client SDK.
 
 ---
 
@@ -22,7 +22,7 @@ KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **P
 | Need | KVS | Redis | Upstash |
 |---|---|---|---|
 | Infrastructure | SQLite file or PostgreSQL | Server required | Managed |
-| Embeddable | Yes — just `new KVStore()` | No (separate process) | No |
+| Embeddable | Yes, just `new KVStore()` | No (separate process) | No |
 | Backends | SQLite (sync), SQLite + PostgreSQL (async) | - | - |
 | Bundle size | ~30 KB (SQLite) / ~no extra (PG) | ~1 MB (ioredis) | N/A |
 | Transactions | Version-based checks + atomic commit | MULTI/EXEC/WATCH | Conditional checks |
@@ -51,15 +51,15 @@ bun:sqlite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2
 
 ## Features
 
-- **Hierarchical keys** — `["users", "alice"]`, prefix/range queries, deterministic sort
-- **Any JSON value** — strings, numbers, objects, arrays, null
-- **Atomic transactions** — version checks + set/delete/enqueue in one commit
-- **TTL expiry** — millisecond precision, background cleanup every 60 s
-- **Built-in queue** — delayed delivery, retries, work-stealing listeners
-- **Real-time watch** — subscribe to key changes (requires `@coderbuzz/kvs-server`)
-- **getAsync** — cache-with-compute with singleflight deduplication
-- **Multi-backend** — SQLite (sync), SQLite + PostgreSQL (async) via unified `AsyncKVStore`
-- **Zero dependencies** — no external libs beyond bun:sqlite / bun:sql
+- **Hierarchical keys**: `["users", "alice"]`, prefix/range queries, deterministic sort
+- **Any JSON value**: strings, numbers, objects, arrays, null
+- **Atomic transactions**: version checks + set/delete/enqueue in one commit
+- **TTL expiry**: millisecond precision, background cleanup every 60 s
+- **Built-in queue**: delayed delivery, retries, work-stealing listeners
+- **Real-time watch**: subscribe to key changes (requires `@coderbuzz/kvs-server`)
+- **getAsync**: cache-with-compute with singleflight deduplication
+- **Multi-backend**: SQLite (sync), SQLite + PostgreSQL (async) via unified `AsyncKVStore`
+- **Zero dependencies**: no external libs beyond bun:sqlite / bun:sql
 
 ---
 
@@ -171,12 +171,12 @@ store.list({ prefix: ["logs"] }, { limit: 5, reverse: true });
 Cache-with-compute pattern with singleflight deduplication:
 
 ```ts
-// 100 concurrent callers — fn() runs once, result cached for 30 s
+// 100 concurrent callers: fn() runs once, result cached for 30 s
 const ad = await store.getAsync(["ads", "venue", 42], () => fetchNextAd(42), 30_000);
 ```
 
 **Algorithm:**
-1. Check SQLite — return immediately on cache hit
+1. Check SQLite: return immediately on cache hit
 2. Singleflight dedup within process
 3. Call `fn()` exactly once
 4. Store result in SQLite with TTL
@@ -200,7 +200,7 @@ const result = store
 if (result.ok) {
   console.log("Version:", result.version);
 } else {
-  console.log("Check failed — retry");
+  console.log("Check failed, retry");
 }
 ```
 
@@ -233,13 +233,13 @@ Dequeue messages ready for delivery. Messages move to `"processing"` status. Not
 ```ts
 const messages = store.dequeue("emails", 10);
 
-// Process in a loop — acknowledge on success, skip on failure
+// Process in a loop: acknowledge on success, skip on failure
 for (const msg of messages) {
   try {
     await sendEmail(msg.payload);
     store.acknowledge(msg.id); // mark as done
   } catch {
-    // Don't acknowledge — auto-requeued after 30s (up to maxAttempts)
+    // Don't acknowledge, auto-requeued after 30s (up to maxAttempts)
   }
 }
 ```
@@ -298,7 +298,7 @@ const { cancel } = store.addQueueListener("emails", (msg) => {
 cancel();
 ```
 
-Dispatch timer runs every 1 s (messages aren't instant). Messages distributed round-robin across all listeners on the same topic — each message goes to exactly one listener.
+Dispatch timer runs every 1 s (messages aren't instant). Messages distributed round-robin across all listeners on the same topic. Each message goes to exactly one listener.
 
 ### `cleanExpired(): number`
 
@@ -308,7 +308,7 @@ of deleted rows and emits `null` tombstones to active watchers.
 ```ts
 store.set(["cache", "a"], "x", { ttl: 1000 });
 store.set(["cache", "b"], "y", { ttl: 1000 });
-// After 2s, entries are expired — cleanExpired() removes them immediately
+// After 2s, entries are expired: cleanExpired() removes them immediately
 store.cleanExpired(); // returns 2
 ```
 
