@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@ba4a5ed -->
+<!-- docs: sync from coderbuzz/codex@7d74651 -->
 
 # KVS &mdash; `@coderbuzz/kvs`
 
@@ -43,7 +43,7 @@ Full results at **[github.com/coderbuzz/benchmarks](https://github.com/coderbuzz
 | Async SQLite | 63,515 ops/s | 138,270 ops/s | 154,585 ops/s | 269,875 ops/s | 42,597 ops/s |
 | Async PostgreSQL | 1,796 ops/s | 10,947 ops/s | 11,181 ops/s | 11,609 ops/s | 1,589 ops/s |
 
-KVS is powered by SQLite WAL mode — read performance is exceptional (1.20M hits, 2.03M misses per second), while writes are bounded by SQLite commit speed (~198K ops/s). All operations are **winner** benchmarks with no comparable competitor at this speed for an embeddable KV store.
+KVS runs on SQLite WAL mode: reads hit 1.20M ops/s (cache hit) and 2.03M ops/s (cache miss), while writes are bounded by SQLite commit speed (~198K ops/s).
 
 bun:sqlite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2-4x overhead per operation due to `await` + `bun:sql` abstraction. PostgreSQL adds network round-trip overhead (~10-50x vs SQLite) but enables multi-process concurrency, horizontal scaling, and shared access.
 
