@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@200be78 -->
+<!-- docs: sync from coderbuzz/codex@b37bd48 -->
 
 # KVS: AI Agent Knowledge File
 
@@ -39,7 +39,7 @@ AsyncKVStore("sqlite://kv.db" | "postgres://...")
   ├── list                    : prefix/range queries (async)
   ├── atomic()                : version-checked transactions (async commit)
   ├── enqueue/dequeue/ack     : persistent queue (async)
-  ├── watch()                 : same as KVStore (in-process)
+  ├── watch()                 : same as KVStore (in-process; initial snapshot delivered async)
   ├── addQueueListener()      : same as KVStore
   ├── getAsync()              : same as KVStore
   ├── cleanExpired() / reset() : async
@@ -61,6 +61,7 @@ import {
   type SqlAdapter,
   encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor,
   type KvKey, type KvKeyPart, type KvEntry,
+  type KvWatchEvent, type KvWatchDiagnostics,
   type KvCommitResult, type KvCommitError,
   type KvCheck, type KvMutation,
   type KvListSelector, type KvListOptions, type KvListResult,
@@ -132,7 +133,7 @@ KvKey = KvKeyPart[]
 Sort: Uint8Array < string < number < bigint < false < true
 ```
 
-Encoding: each key part is prefixed with a type-tag byte + varint-length, then sorted lexicographically as bytes.
+Encoding: each key part is a type-tag byte (`0x01` bytes, `0x02` string, `0x03` number, `0x04` bigint, `0x05` false, `0x06` true) followed by its payload, then a `0x00` separator. String/byte payloads escape `0x00` as `0x00 0xff`; numbers are 8-byte big-endian float64 with sign-flip so byte order matches numeric order; bigints are a sign byte, a length byte, then magnitude bytes. The concatenated bytes sort lexicographically. An empty key encodes to zero bytes.
 
 ```ts
 import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbuzz/kvs";
@@ -167,7 +168,9 @@ const store = new KVStore("kv.db");                 // sync, bun:sqlite
 ### `new AsyncKVStore(connection: string | { adapter: SqlAdapter })`
 - Auto-detects adapter from connection string:
   - `"postgres://..."` or `"postgresql://..."` → `PostgresAdapter`
-  - `"sqlite://..."`, `"file://..."`, `":memory:"`, or plain filename → `SQLiteAsyncAdapter`
+  - anything else → `SQLiteAsyncAdapter`, which hands the string to Bun's `new SQL(...)`. Use `"sqlite://..."`, `"file://..."`, or `":memory:"`.
+  - A plain filename such as `"kv.db"` is NOT SQLite: Bun's `SQL` parses it as a PostgreSQL connection, so the first operation fails with a connection error.
+- Migration and the 60 s cleanup/requeue timer start lazily on the first operation (`ensureInit()`), not in the constructor.
 
 ```ts
 const asyncStore = new AsyncKVStore("sqlite://kv.db");
@@ -290,7 +293,7 @@ store.enqueue(
 
 **Defaults:** `topic: "default"`, `limit: 1`.
 
-Dequeue messages ready for delivery. Messages are moved to `"processing"` status. Not acknowledging within 30s → auto-requeue (up to `maxAttempts`).
+Dequeue messages ready for delivery (`status = 'pending' AND deliver_at <= now`, ordered by `deliver_at ASC, id ASC`, at most `limit` rows). Messages are moved to `"processing"` and `attempts` is incremented. Unacknowledged messages are requeued by the 60 s maintenance timer once `deliver_at` is more than 30 s in the past (up to `maxAttempts`).
 
 ```ts
 const messages = store.dequeue("emails", 10);
@@ -310,7 +313,7 @@ for (const msg of messages) {
 ### `acknowledge(id: number): boolean`
 
 ```ts
-store.acknowledge(message.id); // marks as "done". Returns true if found.
+store.acknowledge(message.id); // marks as "done". Returns true only if the message was in "processing".
 ```
 
 **Message lifecycle:**
@@ -320,7 +323,7 @@ pending → (dequeue) → processing → (acknowledge) → done
                         requeue → pending (up to maxAttempts)
 ```
 
-Failed message requeue runs every 60s. Messages older than 30s with `attempts < maxAttempts` are requeued.
+Failed message requeue runs every 60s. It sets `status = 'pending'` for rows with `status = 'processing' AND attempts < max_attempts AND deliver_at <= now - 30000`. The 30 s is measured from `deliver_at`, not from dequeue time, so the effective redelivery delay is 30 to 90 s after `deliver_at` (or the next tick if the message was dequeued late). A message whose `attempts` reached `maxAttempts` stays `processing` permanently; there is no dead-letter state.
 
 ### `watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }`
 
@@ -337,7 +340,7 @@ const { cancel } = store.watch(
 cancel(); // stop watching
 ```
 
-**Internal:** Uses a `watchIndex: Map<hex-encoded-key, Set<Watcher>>`. On any `set`/`delete`/`increment`/`atomic.commit`, all watchers for that key fire. One watcher per `watch()` call can watch multiple keys.
+**Internal:** Uses a `watchIndex: Map<hex-encoded-key, Set<Watcher>>`. On any `set`/`delete`/`increment`/`getAsync` write/`atomic.commit`, every watcher for a changed key fires once per batch. Deleting a key that does not exist emits nothing. One watcher per `watch()` call can watch multiple keys. The callback receives `(entries, event)` where `event` is a `KvWatchEvent`; the initial call has `initial: true`, `changedKeys: []`, and the current sequence. Callback exceptions are caught and counted in `callbackErrors`.
 
 ### `addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }`
 
@@ -351,7 +354,7 @@ const { cancel } = store.addQueueListener("emails", (msg) => {
 cancel();
 ```
 
-**Internal:** Dispatch timer runs every 1s. Messages distributed round-robin across all listeners for the same topic. Timer starts on first listener, stops when last listener is removed.
+**Internal:** Pending messages are dispatched immediately when a listener is added and after every non-delayed `store.enqueue()`. A 1 s timer covers delayed, requeued, and `atomic().enqueue()` messages (atomic commits do not trigger dispatch). Messages distributed round-robin across all listeners for the same topic. Timer starts on first listener, stops when last listener is removed. Listener exceptions are swallowed; the message stays `processing` until requeued.
 
 ### `getAsync<T>(key: KvKey, fn: () => T | Promise<T>, ttl?: number): Promise<T>`
 
@@ -371,7 +374,7 @@ const ad = await store.getAsync(["ads", "venue", 42], () => fetchNextAd(42), 30_
 
 ### `cleanExpired(): number`
 
-Manually delete expired entries. Returns count of deleted rows. (Auto-runs every 60s.)
+Manually delete expired entries. Returns count of deleted rows. (Auto-runs every 60s.) Each deleted key is emitted to active watchers as a `null` tombstone. On `AsyncKVStore`, tombstones require the adapter to implement the optional `cleanExpiredKeys()`; both built-in adapters do, a custom adapter without it only returns the count.
 
 ```ts
 store.set(["cache", "a"], "x", { ttl: 1_000 });
@@ -382,7 +385,7 @@ const deleted = store.cleanExpired(); // 2
 
 ### `reset(): void`
 
-Delete ALL data from `kv` and `queue` tables. Cancels all watchers and listeners.
+Delete ALL data from `kv` and `queue` tables. Watchers stay registered: every watched key receives a `null` tombstone in one batch with `event.reset: true`, and later writes keep being delivered. Queue listeners stay registered.
 
 ```ts
 store.set(["users", "alice"], { name: "Alice" });
@@ -493,7 +496,7 @@ The `AsyncKVStore` uses an internal `SqlAdapter` interface. Built-in adapters:
 | Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
 | Timestamp | `INTEGER` | `BIGINT` |
 | Increment cast | `CAST(value AS TEXT) AS REAL` | `convert_from(value, 'UTF8')::FLOAT8` |
-| Concurrent dequeue | Subquery `IN (SELECT ... LIMIT ?)` | `FOR UPDATE SKIP LOCKED` |
+| Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
 | Partial indexes | `WHERE expires_at IS NOT NULL` | same |
 
 ---
@@ -539,10 +542,11 @@ sf.size;           // number of in-flight keys
 
 ## Internal Behavior (important for debugging)
 
-### Timers (started in constructor, stopped in close())
-- **TTL cleanup:** Every 60s, deletes rows where `expires_at <= now`
-- **Failed message requeue:** Every 60s, requeues messages where `deliver_at <= now` AND `attempts < maxAttempts` AND status is not "done" (older than 30s)
-- **Queue dispatch:** Every 1s, dispatches deliverable messages to active listeners (round-robin)
+### Timers (stopped in close())
+- **TTL cleanup + failed message requeue:** one 60s timer. `KVStore` starts it in the constructor; `AsyncKVStore` starts it after the first operation runs `migrate()`.
+  - Cleanup deletes rows where `expires_at IS NOT NULL AND expires_at <= now` (`DELETE ... RETURNING key`) and emits tombstones.
+  - Requeue sets `status = 'pending'` where `status = 'processing' AND attempts < max_attempts AND deliver_at <= now - 30000`.
+- **Queue dispatch:** Every 1s while at least one listener exists, dispatches deliverable messages to active listeners (round-robin)
 
 ### Watch internals
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
@@ -579,12 +583,16 @@ sf.size;           // number of in-flight keys
 2. `AtomicOperation.check({ version: null })` means "key must NOT exist". This is the opposite of checking a version number.
 3. `watch()` fires immediately with current values, not just on future changes.
 4. `addQueueListener()` callbacks must call `acknowledge()` manually. Messages are NOT auto-acked.
-5. `getAsync()` uses `JSON.stringify(key)` as the singleflight dedup key: same array in same order.
+5. `getAsync()` uses the hex of the encoded key as the singleflight dedup key, so keys that encode identically share one flight. Dedup is per store instance (in-process only).
 6. `KVStore` requires Bun (for `bun:sqlite`). `AsyncKVStore` uses `bun:sql` (built-in, no extra deps).
 7. `close()` stops all timers, cancels all watchers, and closes the database. No operations work after close.
 8. SQLite WAL means concurrent readers are fine, but writers are serialized.
 9. **Engine minimums:** the queue picker is a `WITH ... AS MATERIALIZED` CTE, which requires **PostgreSQL 12+** and **SQLite 3.35+**; `RETURNING` also requires SQLite 3.35+. Bun bundles SQLite 3.43, so only the PostgreSQL server version needs checking.
 10. **`dequeue(topic, limit)` returns at most `limit` rows, and ties in `deliver_at` break on `id ASC`.** Both are load-bearing. The picker must stay inside the materialized CTE: on PostgreSQL an equivalent `id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)` sublink can be planned on the inner side of a nested-loop semi join with no `Materialize` node, rescanning the picker once per outer row. Each rescan re-runs `SKIP LOCKED` against the rows the previous iteration locked, returns a different window, and every candidate row ends up marked `processing`. This delivers a whole backlog to one worker while the call reports the limit it was given. `deliver_at` is a millisecond timestamp, so enqueue bursts tie constantly; without the `id` tiebreaker FIFO order is whatever the planner produces.
+11. `atomic().commit()` returns `{ ok: true, version }` where `version` is the version of the last `set` mutation in the operation, or `0` when it has no `set`.
+12. `new AsyncKVStore("kv.db")` does not open SQLite. Bun's `SQL` treats a protocol-less filename as PostgreSQL. Use `"sqlite://kv.db"`.
+13. Watch `sequence` starts at 0 per store instance and increments per committed batch (including batches no watcher matches). It is not persisted.
+14. `KvWatchEvent.coalesced` is declared but never set by the core store, and `@coderbuzz/kvs-server` does not send it. Treat it as reserved.
 
 ---
 

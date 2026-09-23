@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@200be78 -->
+<!-- docs: sync from coderbuzz/codex@b37bd48 -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -56,7 +56,7 @@ bun:sqlite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2
 - **Atomic transactions**: version checks + set/delete/enqueue in one commit
 - **TTL expiry**: millisecond precision, background cleanup every 60 s
 - **Built-in queue**: delayed delivery, retries, work-stealing listeners
-- **Real-time watch**: subscribe to key changes (requires `@coderbuzz/kvs-server`)
+- **Real-time watch**: in-process key-change callbacks; over the network via `@coderbuzz/kvs-server`
 - **getAsync**: cache-with-compute with singleflight deduplication
 - **Multi-backend**: SQLite (sync), SQLite + PostgreSQL (async) via unified `AsyncKVStore`
 - **Zero dependencies**: no external libs beyond bun:sqlite / bun:sql
@@ -228,7 +228,7 @@ Defaults: `topic: "default"`, `delay: 0`, `maxAttempts: 3`.
 
 ### `dequeue(topic?: string, limit?: number): QueueMessage[]`
 
-Dequeue messages ready for delivery. Messages move to `"processing"` status. Not acknowledged within 30s → auto-requeued (up to `maxAttempts`).
+Dequeue messages ready for delivery. Messages move to `"processing"` status. Unacknowledged messages are requeued by a 60 s maintenance timer once their `deliverAt` is more than 30 s old (up to `maxAttempts`).
 
 ```ts
 const messages = store.dequeue("emails", 10);
@@ -250,7 +250,7 @@ for (const msg of messages) {
 store.acknowledge(message.id);
 ```
 
-Marks message as `"done"`. Not acking within 30 s → auto-requeue (up to `maxAttempts`).
+Marks a `"processing"` message as `"done"` and returns `true`; returns `false` otherwise. Unacknowledged messages are requeued as described under `dequeue` (up to `maxAttempts`).
 
 **Message lifecycle:**
 ```
@@ -298,7 +298,7 @@ const { cancel } = store.addQueueListener("emails", (msg) => {
 cancel();
 ```
 
-Dispatch timer runs every 1 s (messages aren't instant). Messages distributed round-robin across all listeners on the same topic. Each message goes to exactly one listener.
+Pending messages are dispatched when the listener is added and on every non-delayed `enqueue()`. A 1 s timer picks up delayed, requeued, and `atomic()`-enqueued messages. Messages are distributed round-robin across all listeners on the same topic. Each message goes to exactly one listener.
 
 ### `cleanExpired(): number`
 
@@ -349,6 +349,8 @@ Creates an async KV store backed by SQLite or PostgreSQL. Adapter auto-detected 
 new AsyncKVStore("sqlite://kv.db");
 // SQLite in-memory
 new AsyncKVStore(":memory:");
+// SQLite via file:// URL
+new AsyncKVStore("file://kv.db");
 // PostgreSQL
 new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
 // Pre-built adapter
@@ -356,8 +358,8 @@ new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...") });
 ```
 
 **Connection string rules:**
-- `sqlite://...`, `file://...`, `:memory:`, or plain filename → SQLite
-- `postgres://...` or `postgresql://...` → PostgreSQL
+- `postgres://...` or `postgresql://...` → `PostgresAdapter`
+- anything else → `SQLiteAsyncAdapter`, which passes the string to Bun's `SQL`. Use `sqlite://...`, `file://...`, or `:memory:`. A plain filename such as `"kv.db"` is parsed by Bun as a PostgreSQL connection and fails to connect.
 
 ### Methods
 
@@ -378,7 +380,7 @@ await store.close();              // Promise<void>
 await store.getAsync(key, fn, ttl?); // Promise<T> (already async)
 ```
 
-`watch()` and `addQueueListener()` remain sync (in-process callbacks).
+`watch()`, `addQueueListener()`, and `getWatchDiagnostics()` remain sync (in-process callbacks). On `AsyncKVStore` the initial watch snapshot is delivered asynchronously.
 
 ### `atomic(): AsyncAtomicOperation`
 
@@ -419,7 +421,7 @@ const store = new AsyncKVStore({ adapter });
 | Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
 | Timestamp | `INTEGER` | `BIGINT` |
 | Increment cast | `CAST(value AS TEXT) AS REAL` | `convert_from(value, 'UTF8')::FLOAT8` |
-| Concurrent dequeue | Subquery `IN (SELECT ... LIMIT ?)` | `FOR UPDATE SKIP LOCKED` |
+| Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
 | Partial indexes | `WHERE expires_at IS NOT NULL` | same |
 
 ---
