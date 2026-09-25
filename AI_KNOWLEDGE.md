@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@70f6ace -->
+<!-- docs: sync from coderbuzz/codex@15d78e0 -->
 
 # KVS: AI Agent Knowledge File
 
@@ -23,9 +23,11 @@ KVStore("kv.db")
   ├── increment               : atomic counter (sync)
   ├── list                    : prefix/range queries (sync)
   ├── atomic()                : version-checked transactions (sync)
-  ├── enqueue/dequeue/ack     : persistent queue (sync)
+  ├── enqueue/dequeue         : persistent queue with leases (sync)
+  ├── acknowledge/nack/extendLease(id, token)
+  ├── listDead/retryDead/deleteDead, queueStats, cleanQueue
   ├── watch()                 : in-process callbacks (sync)
-  ├── addQueueListener()      : push-based queue delivery (sync)
+  ├── addQueueListener()      : awaited handlers, auto-ack/nack, concurrency
   ├── getAsync()              : cache-with-compute (singleflight, async)
   ├── cleanExpired() / reset()
   └── close()
@@ -38,7 +40,7 @@ AsyncKVStore("sqlite://kv.db" | "postgres://...")
   ├── increment               : atomic counter (async)
   ├── list                    : prefix/range queries (async)
   ├── atomic()                : version-checked transactions (async commit)
-  ├── enqueue/dequeue/ack     : persistent queue (async)
+  ├── enqueue/dequeue/ack/nack, dead letters, stats : persistent queue (async)
   ├── watch()                 : same as KVStore (in-process; initial snapshot delivered async)
   ├── addQueueListener()      : same as KVStore
   ├── getAsync()              : same as KVStore
@@ -56,9 +58,16 @@ import {
   AsyncKVStore, AsyncAtomicOperation,              // async
   Singleflight,
   type WatchCallback,
-  openDatabase, StmtCache,
+  type KVStoreOptions, type AsyncKVStoreOptions, type AsyncKVStoreSettings,
+  openDatabase, StmtCache, type OpenDatabaseOptions,
   SQLiteAsyncAdapter, PostgresAdapter,             // adapters
-  type SqlAdapter,
+  type SQLiteAdapterOptions, type PostgresAdapterOptions, type TableOptions, type Durability,
+  type SqlAdapter, type KvRow, type QueueRow, type QueueStatsRow, type LeaseRow,
+  type SetResult, type IncrementResult, type EnqueueResult,
+  SCHEMA_VERSION,                                  // 2
+  type KvQueueConfig, type KvQueueDiagnostics,
+  type QueueDeadMessage, type QueueDequeueOptions, type QueueNackOptions,
+  type QueueListenerOptions, type QueueStats,
   encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor,
   type KvKey, type KvKeyPart, type KvEntry,
   type KvWatchEvent, type KvWatchDiagnostics,
@@ -100,10 +109,42 @@ interface KvListResult { entries: KvEntry[]; cursor: string | null }
 
 interface QueueMessage {
   id: number; topic: string; payload: unknown
-  enqueuedAt: number; deliverAt: number
-  attempts: number; maxAttempts: number
+  enqueuedAt: number
+  deliverAt: number       // due time; a nack with backoff moves it to the retry time
+  attempts: number        // deliveries so far, this one included
+  maxAttempts: number
+  token: string           // lease token of this delivery (crypto.randomUUID, shared by one dequeue call)
+  lockedUntil: number     // lease end, ms epoch
+  lastError: string | null // error text of the last failed attempt (nack or "lease expired")
 }
-interface QueueOptions { topic?: string; delay?: number; maxAttempts?: number }
+interface QueueDeadMessage {
+  id: number; topic: string; payload: unknown
+  enqueuedAt: number; deliverAt: number; attempts: number; maxAttempts: number
+  lastError: string | null
+  failedAt: number        // when it was dead-lettered
+}
+interface QueueOptions { topic?: string; delay?: number; maxAttempts?: number } // maxAttempts: integer >= 1, default 3
+interface QueueDequeueOptions { visibilityTimeout?: number }                    // ms > 0
+interface QueueNackOptions { error?: string | null; delay?: number }            // delay ms >= 0 overrides backoff
+interface QueueListenerOptions { concurrency?: number; visibilityTimeout?: number; autoAck?: boolean }
+interface KvQueueConfig {
+  visibilityTimeout?: number                         // default 30_000
+  backoff?: number[] | ((attempt: number) => number) // default min(1000 * 2^(attempt-1), 300_000)
+  doneRetention?: number                             // default 0 (delete on ack)
+  deadRetention?: number                             // default Infinity
+}
+interface QueueStats {
+  topic: string
+  pending: number; delayed: number; processing: number; dead: number; done: number
+  oldestPendingAt: number | null
+}
+interface KvQueueDiagnostics {
+  listeners: number; inFlight: number
+  delivered: number; acked: number; nacked: number
+  handlerErrors: number
+  leaseLost: number       // ack/nack/renewal refused: the lease moved to another delivery
+  dispatchErrors: number  // failed dequeue/ack/renewal (closed store, lost connection)
+}
 
 interface KvWatchEvent {
   sequence: number       // monotonic only for the current store process
@@ -156,27 +197,47 @@ const upper = prefixSuccessor(prefix);
 
 ## Constructors
 
-### `new KVStore(path?: string)`
+### `new KVStore(path?: string, options?: KVStoreOptions)`
 - **Default path:** `"kv.db"`
-- Opens/creates SQLite database with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`
-- Starts TTL cleanup timer (every 60s) and failed message requeue timer (every 60s)
+- Opens/creates SQLite database with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`, then runs the schema migration (see "Schema versions") inside `BEGIN IMMEDIATE`. A failed migration closes the database and throws.
+- Starts one 60 s maintenance timer: TTL cleanup + queue maintenance (`cleanQueue()`).
+- `options`:
+
+| Option | Type | Default | Notes |
+|---|---|---|---|
+| `tablePrefix` | `string` | `""` | `/^[A-Za-z_][A-Za-z0-9_]*$/`, max 40 chars; else `TypeError`. Applies to tables and indexes (`idx_<prefix>kv_expires` …) |
+| `durability` | `"normal" \| "full"` | `"normal"` | `PRAGMA synchronous`; other values `TypeError` |
+| `queue` | `KvQueueConfig` | see Types | invalid values `RangeError` (`backoff` of the wrong type: `TypeError`) |
 
 ```ts
 const store = new KVStore("kv.db");                 // sync, bun:sqlite
+const shared = new KVStore("app.db", { tablePrefix: "kvs_", durability: "full", queue: { visibilityTimeout: 60_000 } });
 ```
 
-### `new AsyncKVStore(connection: string | { adapter: SqlAdapter })`
+### `new AsyncKVStore(connection: string | { adapter: SqlAdapter; queue?: KvQueueConfig }, settings?: AsyncKVStoreSettings)`
 - Auto-detects adapter from connection string:
-  - `"postgres://..."` or `"postgresql://..."` → `PostgresAdapter`
-  - anything else → `SQLiteAsyncAdapter`, which hands the string to Bun's `new SQL(...)`. Use `"sqlite://..."`, `"file://..."`, or `":memory:"`.
+  - `"postgres://..."` or `"postgresql://..."` → `PostgresAdapter(conn, { tablePrefix, schema })`
+  - anything else → `SQLiteAsyncAdapter(conn, { tablePrefix, durability })`, which hands the string to Bun's `new SQL(...)`. Use `"sqlite://..."`, `"file://..."`, or `":memory:"`.
   - A plain filename such as `"kv.db"` is NOT SQLite: Bun's `SQL` parses it as a PostgreSQL connection, so the first operation fails with a connection error.
-- Migration and the 60 s cleanup/requeue timer start lazily on the first operation (`ensureInit()`), not in the constructor. If `migrate()` rejects (database not up yet), that call rejects and the next operation runs `migrate()` again; a failure is not cached.
+- `settings: { tablePrefix?, schema?, durability?, queue? }`. `schema` with SQLite, or `durability` with PostgreSQL, throws `TypeError`. With `{ adapter }`, passing `tablePrefix`/`schema`/`durability` in `settings` throws `TypeError` (configure the adapter); `queue` may go in either object.
+- Migration and the 60 s maintenance timer start lazily on the first operation (`ensureInit()`), not in the constructor. If `migrate()` rejects (database not up yet, or a foreign table), that call rejects and the next operation runs `migrate()` again; a failure is not cached.
 
 ```ts
 const asyncStore = new AsyncKVStore("sqlite://kv.db");
-const pgStore = new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
-const customStore = new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...") });
+const pgStore = new AsyncKVStore("postgres://user:pass@localhost:5432/app", { tablePrefix: "kvs_", schema: "infra" });
+const customStore = new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...", { tablePrefix: "kvs_" }) });
 ```
+
+### Schema versions (KVS-21)
+- `SCHEMA_VERSION = 2`, stored as text in `<prefix>meta` under key `schema_version`. A database without the row is new or was written by kvs <= 0.3 (whose tables are exactly version 1).
+- Every open: `CREATE TABLE IF NOT EXISTS meta`, read the version, run the missing steps, write the version, then verify every table has the current columns, all in ONE transaction (SQLite `BEGIN IMMEDIATE`; PostgreSQL `sql.begin` + `pg_advisory_xact_lock` on a hash of `migrate:<meta table>`, and `CREATE SCHEMA IF NOT EXISTS` first when `schema` is set). Concurrent openers (processes) wait for each other; any failure rolls everything back.
+- Step 0 → 1: `CREATE TABLE IF NOT EXISTS kv / queue`, then **verify the version-1 columns**, then the indexes. An existing table of the same name that is not a kvs table (e.g. an application `queue`) fails here with `Error: kvs: table "queue" exists but is not a kvs table (missing columns: payload, enqueued_at, attempts, max_attempts). Use the tablePrefix option ...` before anything is indexed or altered.
+- Step 1 → 2: queue columns `locked_until`, `lease_token`, `last_error`, `finished_at`; `processing` rows get `locked_until = 0` (expired lease: redelivered, or dead-lettered by `cleanQueue()` if attempts are used up); `done` rows get `finished_at = now` (then aged out by `doneRetention`); indexes `idx_<p>queue_lease (status, locked_until) WHERE status='processing'` and `idx_<p>queue_finished (status, finished_at) WHERE finished_at IS NOT NULL`. PostgreSQL also runs `ALTER TABLE kv ALTER COLUMN version TYPE BIGINT`, `ALTER TABLE queue ALTER COLUMN id TYPE BIGINT` and `ALTER SEQUENCE <serial seq> AS BIGINT` (KVS-17): each rewrites its table under an `ACCESS EXCLUSIVE` lock, once.
+- A stored version above `SCHEMA_VERSION` throws `Error: kvs: the database schema is version N, newer than this kvs release supports (2). Upgrade @coderbuzz/kvs.` A non-integer value throws too.
+
+### Durability (KVS-21)
+- SQLite: WAL + `synchronous = NORMAL` (default): durable across a process crash; a power loss or OS crash can lose the last committed transactions (no corruption). `durability: "full"` sets `synchronous = FULL` (fsync per commit). `PRAGMA synchronous` reads 1 / 2.
+- PostgreSQL: the server's `synchronous_commit` decides; kvs sets nothing.
 
 ---
 
@@ -300,9 +361,27 @@ if (result.ok) {
 | `enqueue` | `(payload, options?): this` | `options: QueueOptions` |
 | `commit` | `(): KvCommitResult \| KvCommitError` | Execute all operations atomically. Returns `{ ok: false }` if any check fails. |
 
+### Queue model (0.4)
+
+Statuses: `pending` → `processing` (leased) → deleted on ack (or `done` with `doneRetention > 0`), or `dead`.
+
+```
+enqueue ─▶ pending ──dequeue──▶ processing(lease: locked_until, lease_token)
+             ▲  ▲                 │ acknowledge(id, token) ─▶ row deleted | done (finished_at)
+             │  └─ nack, attempts < max: deliver_at = now + backoff(attempts), token cleared
+             └──── lease expired, attempts < max: reclaimed before a dequeue, token cleared
+                                  │ nack on the last attempt, or lease expired on it (cleanQueue)
+                                  ▼
+                                 dead (finished_at, last_error) ── retryDead ─▶ pending, attempts = 0
+```
+
+- A lease is `visibilityTimeout` ms from dequeue (default 30 000), **not** from `deliver_at` (0.3 counted from `deliver_at`, so a message from a backlog older than 30 s was redelivered while still being processed: KVS-06).
+- `acknowledge`, `nack` and `extendLease` all match `id AND lease_token = token AND status = 'processing'`; a stale token (lease expired and the message reclaimed or redelivered) returns `false`. The token is 122 random bits (`crypto.randomUUID()`), one per `dequeue()` call.
+- Delivery is at-least-once: a handler that outlives its lease without `extendLease` can run twice.
+
 ### `enqueue(payload: unknown, options?: QueueOptions): { ok: true, id: number }`
 
-**Defaults:** `topic: "default"`, `delay: 0`, `maxAttempts: 3`.
+**Defaults:** `topic: "default"`, `delay: 0`, `maxAttempts: 3`. `maxAttempts` must be an integer >= 1 (`RangeError`); `delay` finite (negative = already due).
 
 ```ts
 store.enqueue(
@@ -312,41 +391,54 @@ store.enqueue(
 // { ok: true, id: 1 }
 ```
 
-### `dequeue(topic?: string, limit?: number): QueueMessage[]`
+A due message wakes this store's listeners of the topic (in a microtask, never on the caller's stack).
 
-**Defaults:** `topic: "default"`, `limit: 1`.
+### `dequeue(topic?: string, limit?: number, options?: QueueDequeueOptions): QueueMessage[]`
 
-Dequeue messages ready for delivery (`status = 'pending' AND deliver_at <= now`, ordered by `deliver_at ASC, id ASC`, at most `limit` rows). Messages are moved to `"processing"` and `attempts` is incremented. Unacknowledged messages are requeued by the 60 s maintenance timer once `deliver_at` is more than 30 s in the past (up to `maxAttempts`).
+**Defaults:** `topic: "default"`, `limit: 1` (integer >= 1, capped at 1000), `visibilityTimeout: queue.visibilityTimeout`.
+
+1. At most once per second per store instance (`RECLAIM_INTERVAL`), first reclaim expired leases **of every topic**: `UPDATE queue SET status='pending', locked_until=NULL, lease_token=NULL WHERE status='processing' AND locked_until <= now AND attempts < max_attempts` (PostgreSQL: inside a `MATERIALIZED` CTE with `FOR UPDATE SKIP LOCKED`). `extendLease(…, 0)` resets the interval, so a release is visible to this store's next dequeue at once; other processes see it within a second.
+2. Pick `status = 'pending' AND deliver_at <= now` in a `MATERIALIZED` CTE, `ORDER BY deliver_at, id LIMIT n` (PostgreSQL adds `FOR UPDATE SKIP LOCKED`), set `status='processing', attempts+1, locked_until = now + visibilityTimeout, lease_token = token`, `RETURNING` the message columns. Rows are sorted by `(deliver_at, id)` in JS (RETURNING has no order).
+
+Why not one picker with `OR (status='processing' AND locked_until <= now)`: SQLite answers it with `MULTI-INDEX OR` + `USE TEMP B-TREE FOR ORDER BY`, sorting the whole backlog of the topic on every dequeue (measured: queue cycle behind 10 000 due messages 17 600 → 556 ops/s). A `UNION ALL` of two limited branches kept the index walk but cost 40% at an empty backlog. The separate reclaim + pending-only picker walks `idx_<p>queue_pending (topic, status, deliver_at)` and stops at the LIMIT.
 
 ```ts
-const messages = store.dequeue("emails", 10);
-
-// Worker loop: acknowledge on success, skip on failure
-for (const msg of messages) {
+for (const msg of store.dequeue("emails", 10, { visibilityTimeout: 60_000 })) {
   try {
     await sendEmail(msg.payload);
-    store.acknowledge(msg.id);  // mark as done
-  } catch {
-    // Don't acknowledge, requeued after 30s (up to maxAttempts)
-    console.error(`Failed ${msg.id}, attempt ${msg.attempts + 1}/${msg.maxAttempts}`);
+    store.acknowledge(msg.id, msg.token);
+  } catch (error) {
+    store.nack(msg.id, msg.token, { error: String(error) });
   }
 }
 ```
 
-### `acknowledge(id: number): boolean`
+### `acknowledge(id: number, token: string): boolean`
+- Missing/empty token or non-integer id: `TypeError` (sync throw; async rejects).
+- `doneRetention === 0` (default): `DELETE ... WHERE id AND lease_token AND status='processing'`. Otherwise `UPDATE status='done', finished_at=now, locked_until=NULL, lease_token=NULL`.
+- `false`: not leased under this token any more.
 
-```ts
-store.acknowledge(message.id); // marks as "done". Returns true only if the message was in "processing".
-```
+### `nack(id: number, token: string, options?: QueueNackOptions): boolean`
+- Reads `attempts, max_attempts` of the lease (`getLease`), then one conditional UPDATE. No transaction needed: attempts only change on a dequeue, which changes the token.
+- `attempts >= maxAttempts` → `status='dead', finished_at=now, last_error`. Else `status='pending', deliver_at = now + (options.delay ?? backoff(attempts)), last_error`. Lease cleared either way.
+- `backoff(attempt)`: array → `schedule[min(attempt, length) - 1]`; function → its result, which must be finite >= 0 (`RangeError` otherwise); default `min(1000 * 2^(attempt-1), 300000)` (1 s, 2 s, 4 s … 5 min), no jitter.
+- `error` is stored as given, truncated to 2000 chars. Listener nacks store `error.message` (or `String(error)`).
 
-**Message lifecycle:**
-```
-pending → (dequeue) → processing → (acknowledge) → done
-                           ↓ not acked within 30s
-                        requeue → pending (up to maxAttempts)
-```
+### `extendLease(id: number, token: string, visibilityTimeout?: number): boolean`
+- `locked_until = now + visibilityTimeout` (default `queue.visibilityTimeout`); `0` releases at once (the next dequeue reclaims it, attempts are not refunded). Negative/NaN → `RangeError`.
+- Works after the lease expired as long as the message was not reclaimed yet.
 
-Failed message requeue runs every 60s. It sets `status = 'pending'` for rows with `status = 'processing' AND attempts < max_attempts AND deliver_at <= now - 30000`. The 30 s is measured from `deliver_at`, not from dequeue time, so the effective redelivery delay is 30 to 90 s after `deliver_at` (or the next tick if the message was dequeued late). A message whose `attempts` reached `maxAttempts` stays `processing` permanently; there is no dead-letter state.
+### `listDead(topic = "default", { limit = 100, after = 0 }?): QueueDeadMessage[]`
+Runs `expireLeases` first (dead-letters leases that expired on their last attempt, `last_error = 'lease expired'`), then `SELECT ... WHERE topic AND status='dead' AND id > after ORDER BY id LIMIT limit`.
+
+### `retryDead(topic = "default", id?: number): number` / `deleteDead(topic = "default", id?: number): number`
+One dead message of the topic (`id`), or all of them. `retryDead` sets `status='pending', attempts=0, deliver_at=now, finished_at=NULL` (keeps `last_error`) and wakes listeners. Returns the row count.
+
+### `queueStats(topic?: string): QueueStats[]`
+Runs `expireLeases` first. One row per topic that has rows, ordered by topic; with `topic` given and no rows, one all-zero entry. `pending` = pending and due, `delayed` = pending not yet due, `processing` includes expired leases not yet reclaimed, `oldestPendingAt` = min `deliver_at` of due pending rows.
+
+### `cleanQueue(): number`
+Maintenance, also run by the 60 s timer: `expireLeases(now)` + delete `done` with `finished_at <= now - doneRetention` + (if `deadRetention` finite) delete `dead` with `finished_at <= now - deadRetention`. Returns rows changed. Short-lived scripts should call it: timers are unref'd and may never fire.
 
 ### `watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }`
 
@@ -365,19 +457,20 @@ cancel(); // stop watching
 
 **Internal:** Uses a `watchIndex: Map<hex-encoded-key, Set<Watcher>>`. On any `set`/`delete`/`increment`/`getAsync` write/`atomic.commit`, every watcher for a changed key fires once per batch. Deleting a key that does not exist emits nothing. One watcher per `watch()` call can watch multiple keys. The callback receives `(entries, event)` where `event` is a `KvWatchEvent`; the initial call has `initial: true`, `changedKeys: []`, and the current sequence. Callback exceptions are caught and counted in `callbackErrors`.
 
-### `addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }`
-
-Push-based queue delivery with round-robin work-stealing.
+### `addQueueListener(topic, handler: (msg) => unknown, options?: QueueListenerOptions): { cancel: () => Promise<void> }`
 
 ```ts
-const { cancel } = store.addQueueListener("emails", (msg) => {
-  processEmail(msg.payload);
-  store.acknowledge(msg.id);  // must ack manually
-});
-cancel();
+const listener = store.addQueueListener("emails", async (msg) => {
+  await sendEmail(msg.payload);           // resolve → acknowledged, throw → nacked
+}, { concurrency: 4, visibilityTimeout: 60_000 });
+await listener.cancel();                  // resolves once running handlers settled
 ```
 
-**Internal:** Pending messages are dispatched immediately when a listener is added and after every non-delayed `store.enqueue()`. A 1 s timer covers delayed, requeued, and `atomic().enqueue()` messages (atomic commits do not trigger dispatch). Messages distributed round-robin across all listeners for the same topic. Timer starts on first listener, stops when last listener is removed. Listener exceptions are swallowed; the message stays `processing` until requeued.
+- Options: `concurrency` integer 1..1000 (default 1, `RangeError` otherwise), `visibilityTimeout` (default store's), `autoAck` (default `true`).
+- `autoAck: true`: handler resolves → `acknowledge`; throws/rejects → `nack({ error: message })`. The lease is renewed every `visibilityTimeout / 2` (min 10 ms) while the handler runs.
+- `autoAck: false`: the handler owns the message (call `acknowledge`/`nack` with `msg.token`); the slot is held until the handler's promise settles; no renewal.
+- `cancel()`: stops dequeuing, returns a promise that resolves when in-flight handlers (and their ack/nack) are done. Messages already dequeued after cancel are released (`extendLease(…, 0)`). `close()` cancels all listeners without waiting.
+- See "Queue dispatch internals" for the algorithm.
 
 ### `getAsync<T>(key: KvKey, fn: () => T | Promise<T>, ttl?: number): Promise<T>`
 
@@ -436,7 +529,7 @@ server.on("close", () => store.close());
 
 ## AsyncKVStore API (all async)
 
-### `new AsyncKVStore(connection: string | { adapter: SqlAdapter })`
+### `new AsyncKVStore(connection, settings?)`
 
 Same as KVStore constructor but async. See Constructor section above for connection string rules.
 
@@ -451,8 +544,15 @@ await store.delete(key: KvKey): Promise<void>
 await store.increment(key: KvKey, delta?: number): Promise<number>     // delta default: 1
 await store.list(selector: KvListSelector, options?: KvListOptions): Promise<KvListResult>
 await store.enqueue(payload: unknown, options?: QueueOptions): Promise<{ ok: true, id: number }>
-await store.dequeue(topic?: string, limit?: number): Promise<QueueMessage[]>
-await store.acknowledge(id: number): Promise<boolean>
+await store.dequeue(topic?: string, limit?: number, options?: QueueDequeueOptions): Promise<QueueMessage[]>
+await store.acknowledge(id: number, token: string): Promise<boolean>
+await store.nack(id: number, token: string, options?: QueueNackOptions): Promise<boolean>
+await store.extendLease(id: number, token: string, visibilityTimeout?: number): Promise<boolean>
+await store.listDead(topic?: string, options?: { limit?: number; after?: number }): Promise<QueueDeadMessage[]>
+await store.retryDead(topic?: string, id?: number): Promise<number>
+await store.deleteDead(topic?: string, id?: number): Promise<number>
+await store.queueStats(topic?: string): Promise<QueueStats[]>
+await store.cleanQueue(): Promise<number>
 await store.cleanExpired(): Promise<number>
 await store.reset(): Promise<void>
 await store.close(): Promise<void>
@@ -463,8 +563,9 @@ await store.getAsync<T>(key: KvKey, fn: () => T | Promise<T>, ttl?: number): Pro
 
 ```ts
 store.watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }
-store.addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }
+store.addQueueListener(topic: string, handler: (msg: QueueMessage) => unknown, options?: QueueListenerOptions): { cancel: () => Promise<void> }
 store.getWatchDiagnostics(): KvWatchDiagnostics
+store.getQueueDiagnostics(): KvQueueDiagnostics
 ```
 
 ### `atomic(): AsyncAtomicOperation`
@@ -488,7 +589,13 @@ const result = await store
 
 | Method | Parameter | Default |
 |---|---|---|
-| `KVStore(path)` | `path` | `"kv.db"` |
+| `KVStore(path, options)` | `path` | `"kv.db"` |
+| | `options.tablePrefix` | `""` |
+| | `options.durability` | `"normal"` |
+| | `options.queue.visibilityTimeout` | `30_000` |
+| | `options.queue.backoff` | `min(1000 * 2^(n-1), 300_000)` |
+| | `options.queue.doneRetention` | `0` |
+| | `options.queue.deadRetention` | `Infinity` |
 | `set(key, value, options)` | `options` | `{}` (no TTL) |
 | `increment(key, delta)` | `delta` | `1` |
 | `list(selector, options)` | `options.limit` | `100` |
@@ -496,9 +603,13 @@ const result = await store
 | `enqueue(payload, options)` | `options.topic` | `"default"` |
 | | `options.delay` | `0` |
 | | `options.maxAttempts` | `3` |
-| `dequeue(topic, limit)` | `topic` | `"default"` |
-| | `limit` | `1` |
-| `openDatabase(path)` | `path` | `"kv.db"` |
+| `dequeue(topic, limit, options)` | `topic` | `"default"` |
+| | `limit` | `1` (max 1000) |
+| | `options.visibilityTimeout` | `queue.visibilityTimeout` |
+| `extendLease(id, token, ms)` | `ms` | `queue.visibilityTimeout` |
+| `listDead(topic, options)` | `options.limit` / `after` | `100` / `0` |
+| `addQueueListener(t, h, options)` | `concurrency` / `autoAck` | `1` / `true` |
+| `openDatabase(path, options)` | `path` | `"kv.db"` |
 
 ---
 
@@ -532,9 +643,20 @@ interface SqlAdapter {
   cleanExpired(now: number): Promise<number>;
   cleanExpiredKeys?(now: number): Promise<Uint8Array[]>;             // enables expiry tombstones
   enqueue(topic: string, payload: Uint8Array, now: number, deliverAt: number, maxAttempts: number): Promise<{ id: number }>;
-  dequeue(topic: string, now: number, limit: number): Promise<QueueRow[]>;
-  ack(id: number): Promise<boolean>;
-  requeueFailed(now: number): Promise<number>;
+  // Queue v2 (0.4). Numeric columns must come back as JS numbers (PostgreSQL int8 → Number).
+  reclaimLeases(now: number): Promise<number>;       // expired leases with attempts left → pending, token cleared
+  dequeue(topic: string, now: number, limit: number, lockedUntil: number, token: string): Promise<QueueRow[]>; // pending only
+  ack(id: number, token: string, now: number, retain: boolean): Promise<boolean>;   // delete, or 'done' when retain
+  getLease(id: number, token: string): Promise<{ attempts: number; max_attempts: number } | null>;
+  nack(id: number, token: string, now: number, retryAt: number | null, error: string | null): Promise<boolean>; // null → dead
+  extendLease(id: number, token: string, lockedUntil: number): Promise<boolean>;
+  expireLeases(now: number): Promise<number>;        // expired, attempts >= max → dead, last_error 'lease expired'
+  purgeFinished(doneBefore: number, deadBefore: number | null): Promise<number>;
+  listDead(topic: string, limit: number, afterId: number): Promise<QueueRow[]>;     // rows include finished_at
+  retryDead(topic: string, id: number | null, now: number): Promise<number>;
+  deleteDead(topic: string, id: number | null): Promise<number>;
+  queueStats(topic: string | null, now: number): Promise<QueueStatsRow[]>;
+  reset(): Promise<void>;                            // DELETE both tables (prefix-aware); keeps meta
   transaction<T>(fn: (adapter: SqlAdapter) => Promise<T>): Promise<T>;
   // Optional, called on the transaction adapter by atomic().commit(). Needed on a
   // backend that runs transactions concurrently (PostgresAdapter implements all three):
@@ -542,9 +664,16 @@ interface SqlAdapter {
   getVersionForUpdate?(key: Uint8Array, now: number): Promise<number | null>; // locks the row
   insertIfAbsent?(key: Uint8Array, value: Uint8Array, expiresAt: number | null, now: number): Promise<{ version: number } | null>;
   close(): Promise<void>;
-  raw(sql: string): Promise<void>;
+  raw(sql: string): Promise<void>;                   // runs as is: table names depend on tablePrefix/schema
+}
+interface QueueRow {
+  id: number; topic: string; payload: Uint8Array; enqueued_at: number; deliver_at: number
+  attempts: number; max_attempts: number; locked_until: number | null; last_error: string | null
+  finished_at?: number | null
 }
 ```
+
+`migrate()` must implement "Schema versions" above (create or upgrade, verify columns, refuse a newer version). 0.3 adapters (`dequeue(topic, now, limit)`, `ack(id)`, `requeueFailed`) no longer compile against 0.4.
 
 `atomic().commit()` inside `transaction()`: `lockKeys(checked ∪ mutated keys)` → each check via `getVersionForUpdate ?? getVersion` → each `set` via `insertIfAbsent` when its key was checked `version: null` (null result = `{ ok: false }`), otherwise `set` → deletes → enqueues.
 
@@ -553,11 +682,15 @@ interface SqlAdapter {
 | Feature | SQLite | PostgreSQL |
 |---|---|---|
 | Key column | `BLOB` | `BYTEA` |
-| Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
+| Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL` in step 1, `BIGINT` + `AS BIGINT` sequence in step 2 |
+| Entry `version` | `INTEGER` (64-bit) | `BIGINT` (step 2); Bun.SQL returns int8 as string, the adapter applies `Number()` |
 | Timestamp | `INTEGER` | `BIGINT` |
 | `increment()` | read-modify-write in one transaction (JS arithmetic) | one upsert, `convert_from(value,'UTF8')::numeric + delta`, returned as `FLOAT8` |
 | `atomic()` concurrency | serial queue: one statement or transaction at a time | `pg_advisory_xact_lock` per key, `SELECT ... FOR UPDATE` for checks, `insertIfAbsent` for `version: null` keys |
 | Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
+| Lease reclaim | one UPDATE | `MATERIALIZED` CTE with `FOR UPDATE SKIP LOCKED`, then UPDATE ... FROM |
+| Migration lock | `BEGIN IMMEDIATE` | `pg_advisory_xact_lock(hash("migrate:" + meta table))` |
+| Table names | `"<prefix>kv"` | `"<schema>"."<prefix>kv"` when `schema` is set |
 | Partial indexes | `WHERE expires_at IS NOT NULL` | same |
 
 ---
@@ -584,8 +717,8 @@ sf.size;           // number of in-flight keys
 
 ### SQLite (KVStore, sync, bun:sqlite)
 - WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`
-- TTL cleanup every 60 s
-- Failed message requeue every 60 s (older than 30 s, up to maxAttempts)
+- TTL cleanup + queue maintenance (`cleanQueue`) every 60 s
+- Lease reclaim before a dequeue, at most once per second
 - List max: 1000 per page
 - Queue dispatch interval: 1 s
 
@@ -598,7 +731,7 @@ sf.size;           // number of in-flight keys
 - Connection pooling (configurable via connection string)
 - `SKIP LOCKED` for safe concurrent dequeue
 - `NUMERIC` arithmetic for increment (exact in storage), result returned as `FLOAT8`
-- `atomic()` locks: advisory lock ids are FNV-1a 64 of `"kvs:" ‖ encodedKey`, deduplicated and taken in ascending order (no lock-order deadlock). A hash collision only makes two keys share a lock. They can collide with an application's own `pg_advisory_xact_lock(bigint)` ids in the same database; that only serializes, it never breaks correctness
+- `atomic()` locks: advisory lock ids are FNV-1a 64 of `namespace ‖ encodedKey`, namespace `"kvs:"` for the default tables (same as 0.3, so 0.3 and 0.4 processes still exclude each other) and `"kvs:<schema>.<prefix>:"` otherwise, deduplicated and taken in ascending order (no lock-order deadlock). A hash collision only makes two keys share a lock. They can collide with an application's own `pg_advisory_xact_lock(bigint)` ids in the same database; that only serializes, it never breaks correctness
 - `BYTEA` for binary key/value storage
 
 ---
@@ -607,10 +740,11 @@ sf.size;           // number of in-flight keys
 
 ### Timers (stopped in close(), unref'd)
 - All internal timers are `unref()`'d: an open store never keeps the process alive. A script that forgets `close()` exits normally (kvs ≤ 0.3.1 hung forever).
-- **TTL cleanup + failed message requeue:** one 60s timer. `KVStore` starts it in the constructor; `AsyncKVStore` starts it after the first operation runs `migrate()`.
+- **Maintenance:** one 60s timer. `KVStore` starts it in the constructor; `AsyncKVStore` starts it after the first operation runs `migrate()`. Errors are counted in `watchDiagnostics.dispatchErrors`.
   - Cleanup deletes rows where `expires_at IS NOT NULL AND expires_at <= now` (`DELETE ... RETURNING key`) and emits tombstones.
-  - Requeue sets `status = 'pending'` where `status = 'processing' AND attempts < max_attempts AND deliver_at <= now - 30000`.
-- **Queue dispatch:** Every 1s while at least one listener exists, dispatches deliverable messages to active listeners (round-robin)
+  - `cleanQueue()`: dead-letter expired last-attempt leases, apply `doneRetention`/`deadRetention`.
+- **Queue poll:** every 1s while at least one listener exists, every listener is notified (picks up delayed messages, retries, reclaimed leases, other processes' enqueues).
+- **Lease renewal:** one interval per listener with in-flight handlers (`autoAck` only), every `visibilityTimeout / 2`.
 
 ### Watch internals
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
@@ -637,22 +771,20 @@ sf.size;           // number of in-flight keys
   callback-error, and dispatch-error counters without high-cardinality labels.
 
 ### Queue dispatch internals
-- `queueListeners: Map<topic, Set<callback>>`
-- `queueRRIndex: Map<topic, number>`, the round-robin index per topic
-- `dispatchToListeners()`: dequeues messages one-by-one, distributes round-robin
-- Stops dispatch timer when all topics have no listeners
-- **Not re-entrant (`KVStore`).** A listener that calls `enqueue()` on its own topic does not start a nested dispatch; the running loop dequeues the new message next. Stack depth stays 1 (kvs ≤ 0.3.1 recursed once per message and silently stopped at the stack limit, ~8,000 messages).
-- **One drain loop per topic (`AsyncKVStore`).** Requests that arrive while it runs set an `again` flag so the loop checks once more before stopping. A failing `dequeue()` (store closed, connection lost) ends the loop and increments `dispatchErrors` instead of becoming an unhandled rejection; `close()` stops the loop.
-- A listener that throws, or returns a rejected promise, is ignored (the promise gets a no-op `catch`). The message stays `processing` until acknowledged or requeued. Handlers are not awaited: an async listener runs concurrently with the next delivery.
-
----
+- `queueWorkers: Map<topic, Set<QueueWorker>>`, one `QueueWorker` (`src/queue.ts`) per `addQueueListener()`; the same class serves `KVStore` and `AsyncKVStore` (it awaits whatever the store returns).
+- `notify()` sets `again = true` and, if no pump is running, schedules one with `queueMicrotask`. Callers: `enqueue()` and `atomic()` commits with a due message on the topic, `retryDead()`, the 1 s poll, a finished handler, the listener's own start. The handler therefore never runs on `enqueue()`'s stack: a listener that enqueues follow-up work to its own topic keeps the stack flat (5 001 chained messages: depth 1).
+- `pump()`: `while (active && again) { again = false; while (inFlight < concurrency) { msgs = await dequeue(topic, concurrency - inFlight, { visibilityTimeout }); if (!msgs.length) break; start each } }`. A dequeue failure (closed store, lost connection) ends the pump and counts `dispatchErrors`; the 1 s poll retries (no hot loop). A wake-up that lands while the pump finishes is not lost: `finally` re-notifies when `again` is set.
+- `run(msg)`: `await handler(msg)`; with `autoAck`, `acknowledge` or `nack`; a `false` result counts `leaseLost`, a throw `dispatchErrors`. Then remove from in-flight, stop renewal when idle, resolve `cancel()` waiters, `notify()`.
+- Renewal skips deliveries whose handler already settled, so a renewal that crosses the ack is not counted as a lost lease.
+- Several listeners of one topic compete: whoever has a free slot dequeues. There is no round-robin (0.3 had one, over a synchronous drain).
+- `getQueueDiagnostics()` sums listeners and in-flight handlers over all workers; counters are shared by the store.
 
 ## Gotchas
 
 1. `KVStore.get()` returns `null` for expired entries (TTL respected).
 2. `AtomicOperation.check({ version: null })` means "key must NOT exist". This is the opposite of checking a version number.
 3. `watch()` fires immediately with current values, not just on future changes.
-4. `addQueueListener()` callbacks must call `acknowledge()` manually. Messages are NOT auto-acked.
+4. `addQueueListener()` handlers are awaited and **auto-acked** (resolve) or **nacked** (throw) since 0.4. Do not also call `acknowledge()` from an `autoAck` handler (the second ack returns `false` and counts `leaseLost`). Use `autoAck: false` to own the message.
 5. `getAsync()` uses the hex of the encoded key as the singleflight dedup key, so keys that encode identically share one flight. Dedup is per store instance (in-process only).
 6. `KVStore` requires Bun (for `bun:sqlite`). `AsyncKVStore` uses `bun:sql` (built-in, no extra deps).
 7. `close()` stops all timers, cancels all watchers, and closes the database. No operations work after close.
@@ -667,10 +799,16 @@ sf.size;           // number of in-flight keys
 16. **`atomic().commit()` is safe under concurrency on every backend.** Two commits that check the same `version` (or `version: null`) never both return `ok: true`, including write skew (A checks B absent and writes A, B checks A absent and writes B: exactly one wins). On PostgreSQL a check waits for an uncommitted write to the checked row and then re-reads it; a `version: null` key that a concurrent plain `set()` creates before the commit makes the commit return `{ ok: false }`.
 17. **Custom `SqlAdapter` on a concurrent backend** must implement `lockKeys`, `getVersionForUpdate` and `insertIfAbsent` for 16 to hold; without them `atomic()` falls back to plain `getVersion()` + `set()`. Its `increment(key, delta, now)` must create missing/expired keys itself; returning `null` (the pre-0.3.2 contract) makes the store fall back to a non-atomic `set()`.
 18. **Do not call a `SQLiteAsyncAdapter` from inside its own `transaction()` callback** except through the adapter the callback receives: the outer adapter waits for the transaction to finish, so the call never completes.
+19. **`acknowledge`/`nack`/`extendLease` need `msg.token`.** A 0.3-style `acknowledge(id)` throws `TypeError`.
+20. **A message is at-least-once.** A handler slower than its lease (without renewal: `autoAck: false`, or a plain `dequeue()` loop) can see its message redelivered to another consumer; its late `acknowledge` then returns `false`.
+21. **Expired leases are reclaimed lazily**: by a dequeue (at most once a second per store) or by `cleanQueue()`/`listDead()`/`queueStats()` (dead-lettering only). Until then `queueStats().processing` still counts them.
+22. **Shared databases**: a table named `kv`, `queue` or `meta` that lacks the kvs columns makes `new KVStore()` throw / the first `AsyncKVStore` operation reject, and is never altered. The check is by column names only: an application table that happens to have them (e.g. `meta(key, value)`) passes, and kvs then writes its `schema_version` row into it. Use `tablePrefix` (and `schema` on PostgreSQL) whenever kvs shares a database. `reset()` deletes only the store's own tables.
+23. **Upgrading a big PostgreSQL database from 0.3** rewrites `kv` and `queue` once (`ALTER COLUMN ... TYPE BIGINT`) under an exclusive lock; every process opening the database waits for the migration.
+24. **`dequeue()` from a 1-row topic can still return nothing right after a release in another process**: other processes reclaim at most once a second.
 
 ---
 
 ## Server & Client
 
-- `@coderbuzz/kvs-server`: `createServer(store)` for sync, `createAsyncServer(store)` for async
+- `@coderbuzz/kvs-server`: `createServer(store)` for sync, `createAsyncServer(store)` for async. Exposes the queue v2 routes (`/queue/nack`, `/queue/extend`, `/queue/dead`, `/queue/stats`, …) and WebSocket listeners that hold `concurrency` slots until the client acks.
 - `@coderbuzz/kvs-client`: TypeScript SDK for the server

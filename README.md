@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@70f6ace -->
+<!-- docs: sync from coderbuzz/codex@15d78e0 -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -55,7 +55,8 @@ bun:sqlite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2
 - **Any JSON value**: strings, numbers, objects, arrays, null
 - **Atomic transactions**: version checks + set/delete/enqueue in one commit
 - **TTL expiry**: millisecond precision, background cleanup every 60 s
-- **Built-in queue**: delayed delivery, retries, work-stealing listeners
+- **Built-in queue**: leases with ack tokens, retries with backoff, dead letters, awaited listeners with concurrency, per-topic stats
+- **Versioned schema**: migrations run on open; `tablePrefix` (and `schema` on PostgreSQL) keep kvs tables apart from yours
 - **Real-time watch**: in-process key-change callbacks; over the network via `@coderbuzz/kvs-server`
 - **getAsync**: cache-with-compute with singleflight deduplication
 - **Multi-backend**: SQLite (sync), SQLite + PostgreSQL (async) via unified `AsyncKVStore`
@@ -72,6 +73,17 @@ npm install @coderbuzz/kvs
 **KVStore** requires Bun (for `bun:sqlite`). **AsyncKVStore** uses `bun:sql` (built-in, no extra deps) and works with SQLite or PostgreSQL.
 
 **Engine minimums.** The queue picker uses `WITH ... AS MATERIALIZED`, which needs **PostgreSQL 12+** and **SQLite 3.35+**. Bun 1.4 bundles SQLite 3.53, so the SQLite backends are always fine; only an older PostgreSQL server is a problem.
+
+### Upgrading from 0.3
+
+Opening a 0.3 database migrates it in place to schema version 2 (recorded in the `meta` table). Nothing to run by hand, but note:
+
+- **PostgreSQL rewrites `kv` and `queue` once** (`version` and the queue `id` become `BIGINT`), holding an exclusive lock on each while it runs. Plan it for a quiet moment on a large table.
+- **`acknowledge(id)` is now `acknowledge(id, token)`**: pass `msg.token` from `dequeue()`.
+- **Listeners are awaited and acknowledge for you**: a handler that resolves acks its message, one that throws nacks it. Remove your own `acknowledge()` call from listeners, or pass `autoAck: false`.
+- **Acknowledged messages are deleted** (0.3 kept them as `done` forever). Keep them for a while with `queue.doneRetention`.
+- A message a 0.3 worker was holding counts as an expired lease and is delivered again.
+- A database that a newer kvs has migrated is refused with an error rather than misread.
 
 ---
 
@@ -100,11 +112,26 @@ await pgStore.delete(["key"]);
 
 ## KVStore API
 
-### `new KVStore(path?: string)`
+### `new KVStore(path?: string, options?: KVStoreOptions)`
 
 Creates or opens a SQLite database. Default path: `"kv.db"`.
 
-Opens with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`.
+Opens with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`, then creates or migrates the tables.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `tablePrefix` | `""` | Prefix for the `kv`, `queue` and `meta` tables, e.g. `"kvs_"` |
+| `durability` | `"normal"` | `"full"` syncs every commit to disk, see [Durability](#durability) |
+| `queue.visibilityTimeout` | `30_000` | Lease length of a dequeued message, ms |
+| `queue.backoff` | 1 s, 2 s, 4 s … max 5 min | Retry delay after a failure: `number[]` (last entry repeats) or `(attempt) => ms` |
+| `queue.doneRetention` | `0` | Keep acknowledged messages this long, ms (0 deletes on ack) |
+| `queue.deadRetention` | `Infinity` | Keep dead messages this long, ms |
+
+**Sharing a database with your application?** kvs refuses to open when a table named `kv`, `queue` or `meta` exists without the kvs columns, and never alters it. The check only looks at column names, so give kvs its own names with `tablePrefix`:
+
+```ts
+const store = new KVStore("app.db", { tablePrefix: "kvs_" }); // kvs_kv, kvs_queue, kvs_meta
+```
 
 ### `get(key: KvKey): KvEntry | null`
 
@@ -219,6 +246,17 @@ if (result.ok) {
 **`check(version: null)`** = "key must not exist".
 **`check(version: N)`** = "key must be at version N".
 
+### Queue
+
+A message is **leased** to one consumer at a time. `dequeue()` hands out the message with a `token`; finish it with `acknowledge(id, token)` or give it back with `nack(id, token)`. If the consumer dies, the lease runs out after `visibilityTimeout` (30 s) and the message is delivered again. After `maxAttempts` deliveries it is **dead-lettered** instead of retried, where you can inspect, retry or delete it.
+
+```
+enqueue → pending ──dequeue──▶ processing ──acknowledge──▶ deleted (or done, with doneRetention)
+             ▲                    │   │
+             └── nack / lease ────┘   └── nack or lease expiry on the last attempt ──▶ dead
+                 expiry (backoff)                                           retryDead ─┘
+```
+
 ### `enqueue(payload: unknown, options?: QueueOptions): { ok: true, id: number }`
 
 ```ts
@@ -228,40 +266,51 @@ store.enqueue(
 );
 ```
 
-Defaults: `topic: "default"`, `delay: 0`, `maxAttempts: 3`.
+Defaults: `topic: "default"`, `delay: 0`, `maxAttempts: 3` (an integer >= 1).
 
-### `dequeue(topic?: string, limit?: number): QueueMessage[]`
+### `dequeue(topic?: string, limit?: number, options?: { visibilityTimeout?: number }): QueueMessage[]`
 
-Dequeue messages ready for delivery. Messages move to `"processing"` status. Unacknowledged messages are requeued by a 60 s maintenance timer once their `deliverAt` is more than 30 s old (up to `maxAttempts`).
+Lease up to `limit` (default 1, max 1000) due messages, oldest first. Each message carries `token`, `lockedUntil`, `attempts` and the `lastError` of the previous attempt.
 
 ```ts
-const messages = store.dequeue("emails", 10);
-
-// Process in a loop: acknowledge on success, skip on failure
-for (const msg of messages) {
+for (const msg of store.dequeue("emails", 10)) {
   try {
     await sendEmail(msg.payload);
-    store.acknowledge(msg.id); // mark as done
-  } catch {
-    // Don't acknowledge, auto-requeued after 30s (up to maxAttempts)
+    store.acknowledge(msg.id, msg.token);
+  } catch (error) {
+    store.nack(msg.id, msg.token, { error: String(error) }); // retried after the backoff
   }
 }
 ```
 
-### `acknowledge(id: number): boolean`
+### `acknowledge(id: number, token: string): boolean`
+
+Finish a message: it is deleted (kept as `done` under `queue.doneRetention`). Returns `false` if the lease is no longer yours: it expired and the message went to someone else.
+
+### `nack(id: number, token: string, options?: { error?: string, delay?: number }): boolean`
+
+Give a message back after a failure. It is retried after the backoff (or `delay` ms), or dead-lettered once it has used `maxAttempts`. `error` is stored as `lastError`.
+
+### `extendLease(id: number, token: string, visibilityTimeout?: number): boolean`
+
+Keep a long job's lease: the lease now ends `visibilityTimeout` ms from now (default: the store's). `0` hands the message back at once.
+
+### `listDead(topic?, { limit?, after? }?)`, `retryDead(topic?, id?)`, `deleteDead(topic?, id?)`
 
 ```ts
-store.acknowledge(message.id);
+for (const msg of store.listDead("emails")) console.log(msg.id, msg.lastError, msg.failedAt);
+store.retryDead("emails", 42); // one message, attempts start again at 0
+store.retryDead("emails");     // every dead message of the topic
+store.deleteDead("emails");
 ```
 
-Marks a `"processing"` message as `"done"` and returns `true`; returns `false` otherwise. Unacknowledged messages are requeued as described under `dequeue` (up to `maxAttempts`).
+### `queueStats(topic?: string): QueueStats[]`
 
-**Message lifecycle:**
-```
-pending → (dequeue) → processing → (acknowledge) → done
-                               ↓ not acked within 30s
-                            requeue → pending (up to maxAttempts)
-```
+Counts per topic: `pending` (due now), `delayed`, `processing`, `dead`, `done`, and `oldestPendingAt` (lag = `Date.now() - oldestPendingAt`).
+
+### `cleanQueue(): number`
+
+Queue maintenance: dead-letters messages whose last lease expired, and deletes `done`/`dead` messages past their retention. Runs every 60 s on its own; call it from a short-lived script, whose timers never fire.
 
 ### `watch(keys: KvKey[], callback: WatchCallback): { cancel: () => void }`
 
@@ -290,19 +339,25 @@ Returns bounded counters for active watchers, committed batches, callbacks,
 shared reads, callback errors, and dispatcher errors. It does not expose raw
 keys or values.
 
-### `addQueueListener(topic: string, callback: (msg: QueueMessage) => void): { cancel: () => void }`
+### `addQueueListener(topic, handler, options?): { cancel: () => Promise<void> }`
 
-Register a push-based listener. Messages distributed round-robin (work-stealing):
+Run `handler` for each message of a topic. The handler is awaited; when it resolves the message is acknowledged, when it throws it is nacked (retried with backoff, dead-lettered after `maxAttempts`). While it runs, the lease is renewed.
 
 ```ts
-const { cancel } = store.addQueueListener("emails", (msg) => {
-  processEmail(msg.payload);
-  store.acknowledge(msg.id);
-});
-cancel();
+const listener = store.addQueueListener("emails", async (msg) => {
+  await sendEmail(msg.payload); // throw to retry
+}, { concurrency: 4 });
+
+await listener.cancel(); // stops taking messages, waits for running handlers
 ```
 
-Pending messages are dispatched when the listener is added and on every non-delayed `enqueue()`. A 1 s timer picks up delayed, requeued, and `atomic()`-enqueued messages. Messages are distributed round-robin across all listeners on the same topic. Each message goes to exactly one listener.
+| Option | Default | Meaning |
+|---|---|---|
+| `concurrency` | `1` | Handlers of this listener running at once |
+| `visibilityTimeout` | store's | Lease length |
+| `autoAck` | `true` | `false`: the handler calls `acknowledge`/`nack` itself |
+
+Handlers never run inside `enqueue()`. Several listeners of a topic (in this or other processes) share its messages. New messages wake the listener at once, including those from `atomic().enqueue()`; delayed messages, retries and other processes' messages are picked up by a 1 s poll. `getQueueDiagnostics()` returns counters: delivered, acked, nacked, handler errors, lost leases.
 
 ### `cleanExpired(): number`
 
@@ -328,6 +383,10 @@ store.reset();
 store.get(["users", "alice"]); // null
 ```
 
+### Durability
+
+SQLite runs in WAL mode with `synchronous = NORMAL` by default: a power cut or OS crash can lose the last transactions, but never corrupts the file. A process crash loses nothing. Pass `durability: "full"` to sync every commit, at the cost of write throughput. On PostgreSQL durability is the server's setting (`synchronous_commit`).
+
 ### `close(): void`
 
 Close database, stop cleanup/dispatch timers, cancel watchers/listeners. No operations work after close. The timers are unref'd, so a script that never calls `close()` still exits.
@@ -344,7 +403,7 @@ process.on("SIGINT", () => {
 
 ## AsyncKVStore API
 
-### `new AsyncKVStore(connection: string | { adapter: SqlAdapter })`
+### `new AsyncKVStore(connection: string | { adapter: SqlAdapter, queue? }, settings?)`
 
 Creates an async KV store backed by SQLite or PostgreSQL. Adapter auto-detected from connection string:
 
@@ -355,11 +414,13 @@ new AsyncKVStore("sqlite://kv.db");
 new AsyncKVStore(":memory:");
 // SQLite via file:// URL
 new AsyncKVStore("file://kv.db");
-// PostgreSQL
-new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
+// PostgreSQL, tables kvs_kv/kvs_queue/kvs_meta in schema "infra"
+new AsyncKVStore("postgres://user:pass@localhost:5432/app", { tablePrefix: "kvs_", schema: "infra" });
 // Pre-built adapter
-new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...") });
+new AsyncKVStore({ adapter: new PostgresAdapter("postgres://...", { tablePrefix: "kvs_" }) });
 ```
+
+`settings` takes `tablePrefix`, `schema` (PostgreSQL only, created if missing), `durability` (SQLite only) and `queue` (as for `KVStore`). With a pre-built adapter, give the table options to the adapter.
 
 **Connection string rules:**
 - `postgres://...` or `postgresql://...` → `PostgresAdapter`
@@ -376,15 +437,22 @@ await store.delete(key);          // Promise<void>
 await store.list(sel, opts?);     // Promise<KvListResult>
 await store.increment(key, n?);   // Promise<number>
 await store.enqueue(payload, opts?); // Promise<{ ok, id }>
-await store.dequeue(topic?, n?);  // Promise<QueueMessage[]>
-await store.acknowledge(id);      // Promise<boolean>
+await store.dequeue(topic?, n?, opts?); // Promise<QueueMessage[]>
+await store.acknowledge(id, token);    // Promise<boolean>
+await store.nack(id, token, opts?);    // Promise<boolean>
+await store.extendLease(id, token, ms?); // Promise<boolean>
+await store.listDead(topic?, opts?);   // Promise<QueueDeadMessage[]>
+await store.retryDead(topic?, id?);    // Promise<number>
+await store.deleteDead(topic?, id?);   // Promise<number>
+await store.queueStats(topic?);        // Promise<QueueStats[]>
+await store.cleanQueue();              // Promise<number>
 await store.cleanExpired();       // Promise<number>
 await store.reset();              // Promise<void>
 await store.close();              // Promise<void>
 await store.getAsync(key, fn, ttl?); // Promise<T> (already async)
 ```
 
-`watch()`, `addQueueListener()`, and `getWatchDiagnostics()` remain sync (in-process callbacks). On `AsyncKVStore` the initial watch snapshot is delivered asynchronously.
+`watch()`, `addQueueListener()`, `getWatchDiagnostics()` and `getQueueDiagnostics()` remain sync (in-process callbacks). On `AsyncKVStore` the initial watch snapshot is delivered asynchronously.
 
 On SQLite, `AsyncKVStore` runs one statement at a time (Bun's SQLite client has a single connection), so an `atomic()` never picks up or rolls back another call's write. On PostgreSQL, `atomic()` locks the keys it checks and writes, so two concurrent commits against the same version cannot both succeed.
 
@@ -415,20 +483,24 @@ The `AsyncKVStore` uses an internal `SqlAdapter` interface. You can build custom
 ```ts
 import { PostgresAdapter } from "@coderbuzz/kvs";
 
-const adapter = new PostgresAdapter("postgres://user:pass@localhost:5432/kvdb");
+const adapter = new PostgresAdapter("postgres://user:pass@localhost:5432/kvdb", { tablePrefix: "kvs_", schema: "infra" });
 const store = new AsyncKVStore({ adapter });
 ```
+
+`SQLiteAsyncAdapter(connection, { tablePrefix?, durability? })` and `PostgresAdapter(connection, { tablePrefix?, schema? })`. A custom adapter implements `SqlAdapter`, whose queue methods changed in 0.4 (see AI_KNOWLEDGE.md).
 
 ### SQL Dialect Differences
 
 | Feature | SQLite | PostgreSQL |
 |---|---|---|
 | Key column | `BLOB` | `BYTEA` |
-| Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
+| Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT` from a sequence (0.3 `SERIAL` migrated) |
+| Entry version | `INTEGER` (64-bit) | `BIGINT` (0.3 `INTEGER` migrated) |
 | Timestamp | `INTEGER` | `BIGINT` |
 | `increment()` | read-modify-write in one transaction (JS arithmetic) | one upsert with `NUMERIC` arithmetic (exact decimals) |
 | `atomic()` concurrency | transactions run one at a time | advisory lock per key, `FOR UPDATE` on checked rows |
 | Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
+| Concurrent migration | `BEGIN IMMEDIATE` | transaction-scoped advisory lock |
 | Partial indexes | `WHERE expires_at IS NOT NULL` | same |
 
 ---
@@ -449,8 +521,11 @@ import type {
   KvListSelector,  // { prefix?, start?, end? }
   KvListOptions,   // { limit?, cursor?, reverse? }
   KvListResult,    // { entries, cursor }
-  QueueMessage,    // { id, topic, payload, enqueuedAt, deliverAt, attempts, maxAttempts }
+  QueueMessage,    // { id, topic, payload, enqueuedAt, deliverAt, attempts, maxAttempts, token, lockedUntil, lastError }
+  QueueDeadMessage,// { id, topic, payload, …, lastError, failedAt }
   QueueOptions,    // { topic?, delay?, maxAttempts? }
+  QueueStats,      // { topic, pending, delayed, processing, dead, done, oldestPendingAt }
+  KvQueueConfig,   // { visibilityTimeout?, backoff?, doneRetention?, deadRetention? }
 } from "@coderbuzz/kvs";
 ```
 
