@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@b37bd48 -->
+<!-- docs: sync from coderbuzz/codex@70f6ace -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -71,7 +71,7 @@ npm install @coderbuzz/kvs
 
 **KVStore** requires Bun (for `bun:sqlite`). **AsyncKVStore** uses `bun:sql` (built-in, no extra deps) and works with SQLite or PostgreSQL.
 
-**Engine minimums.** The queue picker uses `WITH ... AS MATERIALIZED`, which needs **PostgreSQL 12+** and **SQLite 3.35+**. Bun bundles SQLite 3.43, so the SQLite backends are always fine; only an older PostgreSQL server is a problem.
+**Engine minimums.** The queue picker uses `WITH ... AS MATERIALIZED`, which needs **PostgreSQL 12+** and **SQLite 3.35+**. Bun 1.4 bundles SQLite 3.53, so the SQLite backends are always fine; only an older PostgreSQL server is a problem.
 
 ---
 
@@ -123,7 +123,7 @@ const result = store.set(["users", "alice"], { name: "Alice" });
 store.set(["cache", "key"], value, { ttl: 60_000 }); // expires in 60 s
 ```
 
-Every `set` increments `version` by 1.
+Every `set` increments `version` by 1. `ttl` must be a finite number ≥ 0 (`RangeError` otherwise).
 
 ### `delete(key: KvKey): void`
 
@@ -133,7 +133,11 @@ store.delete(["users", "alice"]);
 
 ### `increment(key: KvKey, delta?: number): number`
 
-Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist. Default `delta: 1`.
+Atomically increment a numeric value. Creates the key with `delta` if it doesn't exist or has expired. Default `delta: 1`.
+
+- A live key keeps its TTL, so `set(key, 0, { ttl })` + `increment(key)` makes a fixed-window rate limiter.
+- A key that holds anything but a number throws a `TypeError` and is left unchanged.
+- `delta` must be a finite number (`RangeError` otherwise).
 
 ```ts
 // Basic increment
@@ -162,7 +166,7 @@ store.list({ prefix: ["logs"] }, { limit: 20, cursor: cursor });
 store.list({ prefix: ["logs"] }, { limit: 5, reverse: true });
 ```
 
-**Defaults:** `limit: 100`, max `1000`, ascending. `cursor` is opaque base64.
+**Defaults:** `limit: 100`, max `1000` (larger values are capped), ascending. `limit` must be an integer ≥ 1. `cursor` is opaque base64 and only valid for the selector it came from: a cursor outside the selector's range throws a `RangeError`, so a cursor cannot page past a prefix.
 
 **`KvListResult`:** `{ entries: KvEntry[], cursor: string | null }`
 
@@ -326,7 +330,7 @@ store.get(["users", "alice"]); // null
 
 ### `close(): void`
 
-Close database, stop cleanup/dispatch timers, cancel watchers/listeners. No operations work after close.
+Close database, stop cleanup/dispatch timers, cancel watchers/listeners. No operations work after close. The timers are unref'd, so a script that never calls `close()` still exits.
 
 ```ts
 // Graceful shutdown
@@ -382,6 +386,8 @@ await store.getAsync(key, fn, ttl?); // Promise<T> (already async)
 
 `watch()`, `addQueueListener()`, and `getWatchDiagnostics()` remain sync (in-process callbacks). On `AsyncKVStore` the initial watch snapshot is delivered asynchronously.
 
+On SQLite, `AsyncKVStore` runs one statement at a time (Bun's SQLite client has a single connection), so an `atomic()` never picks up or rolls back another call's write. On PostgreSQL, `atomic()` locks the keys it checks and writes, so two concurrent commits against the same version cannot both succeed.
+
 ### `atomic(): AsyncAtomicOperation`
 
 Same fluent builder as `AtomicOperation` but `commit()` is async:
@@ -420,7 +426,8 @@ const store = new AsyncKVStore({ adapter });
 | Key column | `BLOB` | `BYTEA` |
 | Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL PRIMARY KEY` |
 | Timestamp | `INTEGER` | `BIGINT` |
-| Increment cast | `CAST(value AS TEXT) AS REAL` | `convert_from(value, 'UTF8')::FLOAT8` |
+| `increment()` | read-modify-write in one transaction (JS arithmetic) | one upsert with `NUMERIC` arithmetic (exact decimals) |
+| `atomic()` concurrency | transactions run one at a time | advisory lock per key, `FOR UPDATE` on checked rows |
 | Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
 | Partial indexes | `WHERE expires_at IS NOT NULL` | same |
 
