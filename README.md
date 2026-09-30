@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@15d78e0 -->
+<!-- docs: sync from coderbuzz/codex@e61149f -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -52,8 +52,8 @@ bun:sqlite throughput is identical to `KVStore` benchmarks. Async SQLite adds ~2
 ## Features
 
 - **Hierarchical keys**: `["users", "alice"]`, prefix/range queries, deterministic sort
-- **Any JSON value**: strings, numbers, objects, arrays, null
-- **Atomic transactions**: version checks + set/delete/enqueue in one commit
+- **Typed values**: any JSON value, plus `Date`, `bigint`, `Uint8Array`, `Map`, `Set`, `undefined`, `NaN`, `Infinity`; anything else is refused, never silently changed
+- **Atomic transactions**: version checks + set/delete/enqueue in one commit, with store-wide versionstamps (a key never gets an old version back)
 - **TTL expiry**: millisecond precision, background cleanup every 60 s
 - **Built-in queue**: leases with ack tokens, retries with backoff, dead letters, awaited listeners with concurrency, per-topic stats
 - **Versioned schema**: migrations run on open; `tablePrefix` (and `schema` on PostgreSQL) keep kvs tables apart from yours
@@ -73,6 +73,18 @@ npm install @coderbuzz/kvs
 **KVStore** requires Bun (for `bun:sqlite`). **AsyncKVStore** uses `bun:sql` (built-in, no extra deps) and works with SQLite or PostgreSQL.
 
 **Engine minimums.** The queue picker uses `WITH ... AS MATERIALIZED`, which needs **PostgreSQL 12+** and **SQLite 3.35+**. Bun 1.4 bundles SQLite 3.53, so the SQLite backends are always fine; only an older PostgreSQL server is a problem.
+
+### Upgrading from 0.4
+
+Opening a 0.4 database migrates it to schema version 3, once:
+
+- **Versions are store-wide versionstamps.** Every write gets a number no write had before, so a key deleted and created again (or expired) never matches an old version check. Versions no longer go 1, 2, 3 per key; they start above the highest 0.4 version.
+- **`list({ prefix })` returns the children of the prefix only**: not the key `["users"]` itself for `prefix: ["users"]`, and not `["users\0x"]`. `prefix: []` lists every key. `prefix` together with `start` or `end` throws instead of ignoring them.
+- **Values keep their type.** A `Date` comes back as a `Date` (0.4: an ISO string), a `Map`/`Set` as itself (0.4: `{}`), `NaN` as `NaN` (0.4: `null`), a `bigint` is stored (0.4: threw). A function, symbol, class instance or circular value throws a `TypeError` naming where it is. Plain JSON values are stored exactly as in 0.4.
+- **Key encoding:** `-0` is the key `0`, `NaN` is refused, negative bigints sort by value, a bigint over 255 bytes is refused. Keys stored with `-0` or a negative bigint are rewritten during the migration; where the rewritten key already exists, the existing row is kept.
+- **Keys over 2 KiB** (encoded) are refused; `maxKeySize` changes the limit.
+- `atomic().commit()` returns one version for the whole commit (0.4: the last set's, or `0`), and a builder can be committed once.
+- A 0.4 process refuses a database a 0.5 process has migrated.
 
 ### Upgrading from 0.3
 
@@ -126,6 +138,7 @@ Opens with WAL mode, 64 MB cache, 256 MB mmap, `busy_timeout = 5000`, then creat
 | `queue.backoff` | 1 s, 2 s, 4 s … max 5 min | Retry delay after a failure: `number[]` (last entry repeats) or `(attempt) => ms` |
 | `queue.doneRetention` | `0` | Keep acknowledged messages this long, ms (0 deletes on ack) |
 | `queue.deadRetention` | `Infinity` | Keep dead messages this long, ms |
+| `maxKeySize` | `2048` | Longest encoded key, bytes (`Infinity`: no limit) |
 
 **Sharing a database with your application?** kvs refuses to open when a table named `kv`, `queue` or `meta` exists without the kvs columns, and never alters it. The check only looks at column names, so give kvs its own names with `tablePrefix`:
 
@@ -137,7 +150,7 @@ const store = new KVStore("app.db", { tablePrefix: "kvs_" }); // kvs_kv, kvs_que
 
 ```ts
 const entry = store.get(["users", "alice"]);
-// { key: ["users", "alice"], value: { name: "Alice" }, version: 1 }
+// { key: ["users", "alice"], value: { name: "Alice" }, version: 1843 }
 // null if missing or expired
 ```
 
@@ -145,12 +158,15 @@ const entry = store.get(["users", "alice"]);
 
 ```ts
 const result = store.set(["users", "alice"], { name: "Alice" });
-// { ok: true, version: 1 }
+// { ok: true, version: 1843 }
 
 store.set(["cache", "key"], value, { ttl: 60_000 }); // expires in 60 s
+store.set(["event", 1], { at: new Date(), amount: 1999n, raw: new Uint8Array([1, 2]) }); // types kept
 ```
 
-Every `set` increments `version` by 1. `ttl` must be a finite number ≥ 0 (`RangeError` otherwise).
+Every write gets a new **versionstamp**: a number unique across the whole store, increasing within a process. Use it with `atomic().check()`. `ttl` must be a finite number ≥ 0 (`RangeError` otherwise).
+
+**Values:** JSON values plus `Date`, `bigint`, `Uint8Array` (and `Buffer`, returned as `Uint8Array`), `Map`, `Set`, `undefined`, `NaN` and `±Infinity`, nested anywhere. `-0` is stored as `0`. Anything else (functions, symbols, class instances, circular references) throws a `TypeError` naming the path, e.g. `value.items[3].price is a Money`. Shared references are stored as copies.
 
 ### `delete(key: KvKey): void`
 
@@ -183,8 +199,10 @@ if (attempts > 10) throw new Error("Rate limit exceeded");
 ### `list(selector: KvListSelector, options?: KvListOptions): KvListResult`
 
 ```ts
-// Prefix query
+// Children of a prefix (not ["users"] itself)
 store.list({ prefix: ["users"] });
+// Every key
+store.list({ prefix: [] });
 // Range query
 store.list({ start: ["events", 1000], end: ["events", 2000] });
 // Paginated
@@ -193,7 +211,7 @@ store.list({ prefix: ["logs"] }, { limit: 20, cursor: cursor });
 store.list({ prefix: ["logs"] }, { limit: 5, reverse: true });
 ```
 
-**Defaults:** `limit: 100`, max `1000` (larger values are capped), ascending. `limit` must be an integer ≥ 1. `cursor` is opaque base64 and only valid for the selector it came from: a cursor outside the selector's range throws a `RangeError`, so a cursor cannot page past a prefix.
+`prefix` takes no `start`/`end` (a `TypeError`; combining them is planned). **Defaults:** `limit: 100`, max `1000` (larger values are capped), ascending. `limit` must be an integer ≥ 1. `cursor` is opaque base64 and only valid for the selector it came from: a cursor outside the selector's range throws a `RangeError`, so a cursor cannot page past a prefix.
 
 **`KvListResult`:** `{ entries: KvEntry[], cursor: string | null }`
 
@@ -218,18 +236,19 @@ const ad = await store.getAsync(["ads", "venue", 42], () => fetchNextAd(42), 30_
 Fluent builder for version-checked transactions:
 
 ```ts
+const seen = store.get(["counter"])!;       // { value: 3, version: 1843, ... }
 const result = store
   .atomic()
-  .check({ key: ["counter"], version: 3 })  // fail if not at version 3
+  .check({ key: ["counter"], version: seen.version }) // fail if written since
   .check({ key: ["new-key"], version: null }) // fail if exists
-  .set(["counter"], 4)
+  .set(["counter"], seen.value as number + 1)
   .set(["meta"], { updatedAt: Date.now() })
   .delete(["old-key"])
   .enqueue({ task: "notify" }, { topic: "jobs" })
   .commit();
 
 if (result.ok) {
-  console.log("Version:", result.version);
+  console.log("Version:", result.version); // both sets carry this one version
 } else {
   console.log("Check failed, retry");
 }
@@ -244,7 +263,9 @@ if (result.ok) {
 | `commit` | `(): KvCommitResult \| KvCommitError` | Execute transaction |
 
 **`check(version: null)`** = "key must not exist".
-**`check(version: N)`** = "key must be at version N".
+**`check(version: N)`** = "key must be at version N", i.e. unchanged since it was read at N. Because versions are store-wide and never reused, a key deleted and written again (or expired) no longer matches.
+
+A commit gets one versionstamp, returned even when it has no `set`. A builder can be committed once; a second `commit()` throws.
 
 ### Queue
 
@@ -463,7 +484,7 @@ Same fluent builder as `AtomicOperation` but `commit()` is async:
 ```ts
 const result = await store
   .atomic()
-  .check({ key: ["counter"], version: 3 })
+  .check({ key: ["counter"], version: seen.version })
   .set(["counter"], 4)
   .enqueue({ task: "notify" }, { topic: "jobs" })
   .commit();
@@ -496,6 +517,7 @@ const store = new AsyncKVStore({ adapter });
 | Key column | `BLOB` | `BYTEA` |
 | Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT` from a sequence (0.3 `SERIAL` migrated) |
 | Entry version | `INTEGER` (64-bit) | `BIGINT` (0.3 `INTEGER` migrated) |
+| Versionstamp | one-row counter table; each store reserves blocks of 1024 (unique store-wide, increasing per process) | a sequence, `nextval()` per write (unique and increasing store-wide) |
 | Timestamp | `INTEGER` | `BIGINT` |
 | `increment()` | read-modify-write in one transaction (JS arithmetic) | one upsert with `NUMERIC` arithmetic (exact decimals) |
 | `atomic()` concurrency | transactions run one at a time | advisory lock per key, `FOR UPDATE` on checked rows |
@@ -510,7 +532,7 @@ const store = new AsyncKVStore({ adapter });
 ```ts
 import type {
   KvKey,           // KvKeyPart[]
-  KvKeyPart,       // string | number | bigint | boolean | Uint8Array
+  KvKeyPart,       // string | number | bigint | boolean | Uint8Array (NaN refused, -0 = 0)
   KvEntry,         // { key, value, version }
   KvWatchEvent,    // { sequence, initial, changedKeys, coalesced?, reset? }
   KvWatchDiagnostics,
@@ -541,8 +563,11 @@ Uint8Array < string < number < bigint < false < true
 ```ts
 ["a"] < ["b"]
 ["users", 1] < ["users", 2]
+["ledger", -1000n] < ["ledger", -1n] < ["ledger", 0n]
 ["items", true] > ["items", false]
 ```
+
+`-0` and `0` are the same key; `NaN` is not a valid key part; a bigint part holds at most 255 bytes. An encoded key is at most `maxKeySize` bytes (2048 by default, as in Deno KV).
 
 ### Encoding Utilities
 
@@ -555,7 +580,8 @@ import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbu
 const encoded = encodeKey(["users", "alice"]);
 const decoded = decodeKey(encoded); // ["users", "alice"]
 
-// Low-level prefix scan for custom range queries
+// Low-level byte range for custom queries. It includes the key ["events"] itself
+// and string siblings such as ["events\0x"]; list({ prefix }) does not.
 const prefix = encodeKeyPrefix(["events"]);
 const upper = prefixSuccessor(prefix);
 // Range: key >= prefix AND key < upper

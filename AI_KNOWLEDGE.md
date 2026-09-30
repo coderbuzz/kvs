@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@15d78e0 -->
+<!-- docs: sync from coderbuzz/codex@e61149f -->
 
 # KVS: AI Agent Knowledge File
 
@@ -174,7 +174,11 @@ KvKey = KvKeyPart[]
 Sort: Uint8Array < string < number < bigint < false < true
 ```
 
-Encoding: each key part is a type-tag byte (`0x01` bytes, `0x02` string, `0x03` number, `0x04` bigint, `0x05` false, `0x06` true) followed by its payload, then a `0x00` separator. String/byte payloads escape `0x00` as `0x00 0xff`; numbers are 8-byte big-endian float64 with sign-flip so byte order matches numeric order; bigints are a sign byte, a length byte, then magnitude bytes. The concatenated bytes sort lexicographically. An empty key encodes to zero bytes.
+Encoding: each key part is a type-tag byte (`0x01` bytes, `0x02` string, `0x03` number, `0x04` bigint, `0x05` false, `0x06` true) followed by its payload, then a `0x00` separator. String/byte payloads escape `0x00` as `0x00 0xff`; numbers are 8-byte big-endian float64 with sign-flip so byte order matches numeric order; bigints are a sign byte (`0x00` negative, `0x01` otherwise), a length byte, then magnitude bytes, all inverted (`0xff - b`, the length too) for negatives so they sort by value. The concatenated bytes sort lexicographically. An empty key encodes to zero bytes.
+
+Rules (KVS-10, kvs 0.5): `-0` is normalized to `0` (0.4 encoded it as eight `0x00` bytes and decoded it as `NaN`); `NaN` throws `TypeError: kvs: NaN cannot be a key part`; a bigint needs at most 255 magnitude bytes (`RangeError` beyond; 0.4 wrapped the length byte and wrote an undecodable key); any other part type (`null`, `undefined`, object, array, symbol) throws `TypeError` (0.4 wrote it as `true`/`false` by truthiness); a key that is not an array throws `TypeError`. The store refuses an encoded key longer than `maxKeySize` (default 2048) with `RangeError: kvs: key is N bytes encoded, over the 2048-byte limit (maxKeySize)`, on every call that takes a key (reads, writes, checks, list selectors). `encodeKey()` itself has no size limit.
+
+`list({ prefix: p })` reads `[enc(p) ‖ 0x01, enc(p) ‖ 0x07)`: exactly the keys with at least one more part after `p` (KVS-16). `enc(p)` ends with the `0x00` separator; the next byte of a child is its type tag 1..6, while the key `p` itself ends there and a string sibling `"p\0x"` continues with `0xff`. `prefix: []` gives `[0x01, 0x07)`, every key. kvs-server's scoped credentials use the same rule (`withinPrefix`: equal, or the prefix followed by a byte 1..6).
 
 ```ts
 import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbuzz/kvs";
@@ -187,7 +191,8 @@ import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbu
 const encoded = encodeKey(["users", "alice"]);
 const decoded = decodeKey(encoded); // ["users", "alice"]
 
-// Low-level prefix scan for custom range queries
+// Low-level byte range for custom queries: includes the key ["events"] itself and
+// string siblings like ["events\0x"], unlike list({ prefix })
 const prefix = encodeKeyPrefix(["events"]);
 const upper = prefixSuccessor(prefix);
 // Resulting range: key >= prefix AND key < upper
@@ -229,11 +234,23 @@ const customStore = new AsyncKVStore({ adapter: new PostgresAdapter("postgres://
 ```
 
 ### Schema versions (KVS-21)
-- `SCHEMA_VERSION = 2`, stored as text in `<prefix>meta` under key `schema_version`. A database without the row is new or was written by kvs <= 0.3 (whose tables are exactly version 1).
+- `SCHEMA_VERSION = 3`, stored as text in `<prefix>meta` under key `schema_version`. A database without the row is new or was written by kvs <= 0.3 (whose tables are exactly version 1).
 - Every open: `CREATE TABLE IF NOT EXISTS meta`, read the version, run the missing steps, write the version, then verify every table has the current columns, all in ONE transaction (SQLite `BEGIN IMMEDIATE`; PostgreSQL `sql.begin` + `pg_advisory_xact_lock` on a hash of `migrate:<meta table>`, and `CREATE SCHEMA IF NOT EXISTS` first when `schema` is set). Concurrent openers (processes) wait for each other; any failure rolls everything back.
 - Step 0 → 1: `CREATE TABLE IF NOT EXISTS kv / queue`, then **verify the version-1 columns**, then the indexes. An existing table of the same name that is not a kvs table (e.g. an application `queue`) fails here with `Error: kvs: table "queue" exists but is not a kvs table (missing columns: payload, enqueued_at, attempts, max_attempts). Use the tablePrefix option ...` before anything is indexed or altered.
 - Step 1 → 2: queue columns `locked_until`, `lease_token`, `last_error`, `finished_at`; `processing` rows get `locked_until = 0` (expired lease: redelivered, or dead-lettered by `cleanQueue()` if attempts are used up); `done` rows get `finished_at = now` (then aged out by `doneRetention`); indexes `idx_<p>queue_lease (status, locked_until) WHERE status='processing'` and `idx_<p>queue_finished (status, finished_at) WHERE finished_at IS NOT NULL`. PostgreSQL also runs `ALTER TABLE kv ALTER COLUMN version TYPE BIGINT`, `ALTER TABLE queue ALTER COLUMN id TYPE BIGINT` and `ALTER SEQUENCE <serial seq> AS BIGINT` (KVS-17): each rewrites its table under an `ACCESS EXCLUSIVE` lock, once.
-- A stored version above `SCHEMA_VERSION` throws `Error: kvs: the database schema is version N, newer than this kvs release supports (2). Upgrade @coderbuzz/kvs.` A non-integer value throws too.
+- Step 2 → 3 (kvs 0.5): the versionstamp counter (KVS-05) and the key rewrite (KVS-10).
+  - SQLite: `CREATE TABLE <p>kv_versionstamp (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`, one row initialised to `MAX(kv.version)`.
+  - PostgreSQL: `CREATE SEQUENCE <schema>.<p>kv_versionstamp AS BIGINT`, `setval` to `MAX(kv.version)` (or 1 unused when `kv` is empty).
+  - Rekey: candidates are the keys holding a `04 00` (negative bigint) or `03 00×8` (0.4's `-0`) byte run (`instr()` on SQLite, `position()` on PostgreSQL). Each is decoded with the 0.4 decoder (`src/legacy-keys.ts`) and encoded again; unchanged bytes are skipped, a key that cannot be decoded (0.4 bigint over 255 bytes) is left as it is. When the new key already exists (`["x", -0]` next to `["x", 0]`) the old row is deleted and the existing one kept; otherwise `UPDATE kv SET key = new`. Versions and values are kept. Keys with 0.4's `NaN` bytes decode to the same bytes (a subnormal) and stay.
+- A stored version above `SCHEMA_VERSION` throws `Error: kvs: the database schema is version N, newer than this kvs release supports (3). Upgrade @coderbuzz/kvs.` A non-integer value throws too. So a 0.4 process refuses a database a 0.5 process has migrated.
+
+### Versionstamps (KVS-05)
+- Every write (`set`, `increment`, `getAsync` fill, each `atomic()` commit) gets a version no write of this store ever got, so a check `{ key, version }` passes only if the key was not written since it was read at that version, including across delete/recreate and TTL expiry (0.4 restarted a recreated key at 1: ABA).
+- SQLite (both stores): the store reserves `VERSION_BLOCK = 1024` versions with `UPDATE <p>kv_versionstamp SET version = version + 1024 RETURNING version` and hands them out from memory (`src/versions.ts`). Unique store-wide, also across processes on one file (each reservation is its own write; SQLite has one writer at a time), increasing within one store instance; two processes interleave in blocks, so across processes versions are unique but not time-ordered. A crash or close leaves a gap. `KVStore` reserves only outside transactions; `SQLiteAsyncAdapter.transaction()` drops the block when the transaction rolls back, since a reservation made inside it rolled back too.
+- Measured alternative: taking `version + 1` from the counter inside each upsert plus triggers kept one global order but cost 35% of `AsyncKVStore.set` (44K → 29K ops/s raw) and 24% of the raw sync upsert. The block form also dropped `RETURNING`: `KVStore.set` small 202K → 309K ops/s, `AsyncKVStore.set` 36K → 48K.
+- PostgreSQL: `nextval('<p>kv_versionstamp')` inline in the upsert, so versions are unique and increasing store-wide (sequence order, not commit order).
+- `atomic().commit()`: one version for the whole commit, taken before the transaction (`KVStore`) or with `tx.nextVersion()` after the checks (`AsyncKVStore`), written to every `set` of it and returned even for a commit without a `set` (0.4: last set's version or `0`, KVS-20). A builder commits once: a second `commit()` throws `Error: kvs: this atomic operation was already committed`, also after `{ ok: false }`.
+- Numbers stay below 2^53 for any realistic lifetime (a block per store open, 1024 per block).
 
 ### Durability (KVS-21)
 - SQLite: WAL + `synchronous = NORMAL` (default): durable across a process crash; a power loss or OS crash can lose the last committed transactions (no corruption). `durability: "full"` sets `synchronous = FULL` (fsync per commit). `PRAGMA synchronous` reads 1 / 2.
@@ -247,7 +264,7 @@ const customStore = new AsyncKVStore({ adapter: new PostgresAdapter("postgres://
 
 ```ts
 const entry = store.get(["users", "alice"]);
-// { key: ["users", "alice"], value: { name: "Alice" }, version: 1 }
+// { key: ["users", "alice"], value: { name: "Alice" }, version: 1843 }
 // null if missing or expired
 ```
 
@@ -255,11 +272,18 @@ const entry = store.get(["users", "alice"]);
 
 ```ts
 store.set(["users", "alice"], { name: "Alice" });
-// { ok: true, version: 1 }
+// { ok: true, version: 1843 }
 
 store.set(["cache", "key"], value, { ttl: 60_000 }); // expires in 60s
+store.set(["event"], { at: new Date(), cents: 1999n, blob: new Uint8Array([1]), tags: new Set(["a"]) });
 ```
-Every `set` increments `version` by 1. TTL is in milliseconds and must be a finite number ≥ 0; `NaN`, `Infinity` and negative values throw `RangeError` (on `AsyncKVStore`, the promise rejects). `ttl: 0` expires immediately.
+Every write gets a new versionstamp (see "Versionstamps").
+
+**Values (KVS-09).** Stored bytes by first byte: `0x00` null, `0x01` true, `0x02` false, `0x03` typed JSON, anything else plain JSON text (0.4 format, unchanged for plain JSON values).
+- Supported: JSON values plus `Date` (incl. invalid), `bigint`, `Uint8Array` (a `Buffer` comes back as `Uint8Array`), `Map`, `Set`, `undefined` (top level, in objects — the key is kept — and in arrays/holes), `NaN`, `±Infinity`, nested anywhere. `-0` is stored as `0`. Shared references are stored as copies.
+- Typed JSON = JSON where special values are marker objects `{"~": T, "v": …}`: `D` Date (epoch ms or null), `B` bigint (decimal string), `U` Uint8Array (base64), `M` Map (`[[k, v], …]`), `S` Set (array), `u` undefined, `N` number (`"NaN"`, `"Infinity"`, `"-Infinity"`), `O` a user object that has its own `"~"` key (as entries, so it is never read as a marker). Decoding walks the parsed tree (not a `JSON.parse` reviver, which would drop `undefined` properties).
+- Refused with `TypeError: kvs: value.a[2].b is a Money, which kvs cannot store (supported: …)` and nothing written: functions, symbols, class instances (any prototype other than `Object.prototype`/`null`, except the types above; e.g. `RegExp`, `Error`, `Int16Array`), circular references. Checked before any write, also for queue payloads and every `atomic()` mutation.
+- Cost: every write scans the value (a fast scan without path; the naming scan runs only on a refusal). Measured: encoding a small value 10.2M → 8.4M ops/s, an 11.5 KB object 51 µs → 84 µs; `KVStore.set` 11.5 KB 14.9K → 9.9K ops/s (−33%). A scan with `Object.keys`/`Object.values` or inlined primitive checks was not faster. TTL is in milliseconds and must be a finite number ≥ 0; `NaN`, `Infinity` and negative values throw `RangeError` (on `AsyncKVStore`, the promise rejects). `ttl: 0` expires immediately.
 
 ### `delete(key: KvKey): void`
 
@@ -306,7 +330,7 @@ if (attempts > 10) throw new Error("Rate limit exceeded");
 
 ### `list(selector: KvListSelector, options?: KvListOptions): KvListResult`
 
-**Defaults:** `limit: 100`, max `1000`, ascending, `reverse: false`. `cursor` is opaque base64.
+**Defaults:** `limit: 100`, max `1000`, ascending, `reverse: false`. `cursor` is opaque base64. `prefix` with `start` or `end` throws `TypeError: kvs: list() takes { prefix } or { start, end }, not both` (0.4 silently ignored `start`/`end`). Without `prefix`: `start` defaults to the empty key, `end` to `[0xff]`.
 
 **Validation:**
 - `limit` must be an integer ≥ 1, otherwise `RangeError` (`0`, negatives, `2.5`, `NaN`, `Infinity`). Values above 1000 are capped to 1000, not rejected.
@@ -314,8 +338,10 @@ if (attempts > 10) throw new Error("Rate limit exceeded");
 - A cursor is not bound to its selector beyond that range check: reusing a cursor with a different selector whose range still contains it is allowed.
 
 ```ts
-// Prefix query
+// Children of a prefix: not ["users"] itself, not ["users\0x"] (KVS-16)
 store.list({ prefix: ["users"] });
+// Every key
+store.list({ prefix: [] });
 
 // Range query
 store.list({ start: ["events", 1000], end: ["events", 2000] });
@@ -334,9 +360,10 @@ store.list({ prefix: ["logs"] }, { limit: 5, reverse: true });
 Fluent builder for version-checked transactions. All operations run in a single SQLite transaction.
 
 ```ts
+const seen = store.get(["counter"])!;
 const result = store
   .atomic()
-  .check({ key: ["counter"], version: 3 })       // fail if not at version 3
+  .check({ key: ["counter"], version: seen.version }) // fail if written since
   .check({ key: ["new-key"], version: null })     // fail if key exists
   .set(["counter"], 4)
   .set(["meta"], { updatedAt: Date.now() })
@@ -359,7 +386,7 @@ if (result.ok) {
 | `set` | `(key, value, options?): this` | `options: { ttl?: number }` |
 | `delete` | `(key): this` | |
 | `enqueue` | `(payload, options?): this` | `options: QueueOptions` |
-| `commit` | `(): KvCommitResult \| KvCommitError` | Execute all operations atomically. Returns `{ ok: false }` if any check fails. |
+| `commit` | `(): KvCommitResult \| KvCommitError` | Execute all operations atomically. Returns `{ ok: false }` if any check fails, else `{ ok: true, version }` with the commit's one versionstamp. Once per builder. |
 
 ### Queue model (0.4)
 
@@ -590,6 +617,7 @@ const result = await store
 | Method | Parameter | Default |
 |---|---|---|
 | `KVStore(path, options)` | `path` | `"kv.db"` |
+| | `options.maxKeySize` | `2048` (bytes, encoded) |
 | | `options.tablePrefix` | `""` |
 | | `options.durability` | `"normal"` |
 | | `options.queue.visibilityTimeout` | `30_000` |
@@ -631,7 +659,10 @@ interface KvRow { key: Uint8Array; value: Uint8Array; version: number }
 interface SqlAdapter {
   migrate(): Promise<void>;
   get(key: Uint8Array, now: number): Promise<KvRow | null>;          // live rows only
-  set(key: Uint8Array, value: Uint8Array, expiresAt: number | null): Promise<{ version: number }>;
+  // Without `version`: take the next versionstamp; with it: the one nextVersion()
+  // returned for this atomic() commit (KVS-05)
+  set(key: Uint8Array, value: Uint8Array, expiresAt: number | null, version?: number): Promise<{ version: number }>;
+  nextVersion(): Promise<number>;                    // unique store-wide, never reused
   delete(key: Uint8Array): Promise<boolean>;
   getVersion(key: Uint8Array, now: number): Promise<number | null>;
   // Must create a missing/expired key with `delta` (no TTL), keep a live key's TTL,
@@ -791,7 +822,7 @@ sf.size;           // number of in-flight keys
 8. SQLite WAL means concurrent readers are fine, but writers are serialized.
 9. **Engine minimums:** the queue picker is a `WITH ... AS MATERIALIZED` CTE, which requires **PostgreSQL 12+** and **SQLite 3.35+**; `RETURNING` also requires SQLite 3.35+. Bun 1.4 bundles SQLite 3.53, so only the PostgreSQL server version needs checking.
 10. **`dequeue(topic, limit)` returns at most `limit` rows, and ties in `deliver_at` break on `id ASC`.** Both are load-bearing. The picker must stay inside the materialized CTE: on PostgreSQL an equivalent `id IN (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)` sublink can be planned on the inner side of a nested-loop semi join with no `Materialize` node, rescanning the picker once per outer row. Each rescan re-runs `SKIP LOCKED` against the rows the previous iteration locked, returns a different window, and every candidate row ends up marked `processing`. This delivers a whole backlog to one worker while the call reports the limit it was given. `deliver_at` is a millisecond timestamp, so enqueue bursts tie constantly; without the `id` tiebreaker FIFO order is whatever the planner produces.
-11. `atomic().commit()` returns `{ ok: true, version }` where `version` is the version of the last `set` mutation in the operation, or `0` when it has no `set`.
+11. `atomic().commit()` returns `{ ok: true, version }`: the one versionstamp of the commit, which every `set` of it carries, also when it has no `set` (0.4: the last set's version, or `0`). A builder commits once.
 12. `new AsyncKVStore("kv.db")` does not open SQLite. Bun's `SQL` treats a protocol-less filename as PostgreSQL. Use `"sqlite://kv.db"`.
 13. Watch `sequence` starts at 0 per store instance and increments per committed batch (including batches no watcher matches). It is not persisted.
 14. `KvWatchEvent.coalesced` is declared but never set by the core store, and `@coderbuzz/kvs-server` does not send it. Treat it as reserved.
@@ -805,6 +836,10 @@ sf.size;           // number of in-flight keys
 22. **Shared databases**: a table named `kv`, `queue` or `meta` that lacks the kvs columns makes `new KVStore()` throw / the first `AsyncKVStore` operation reject, and is never altered. The check is by column names only: an application table that happens to have them (e.g. `meta(key, value)`) passes, and kvs then writes its `schema_version` row into it. Use `tablePrefix` (and `schema` on PostgreSQL) whenever kvs shares a database. `reset()` deletes only the store's own tables.
 23. **Upgrading a big PostgreSQL database from 0.3** rewrites `kv` and `queue` once (`ALTER COLUMN ... TYPE BIGINT`) under an exclusive lock; every process opening the database waits for the migration.
 24. **`dequeue()` from a 1-row topic can still return nothing right after a release in another process**: other processes reclaim at most once a second.
+25. **Versions are not 1, 2, 3 per key** (0.5). Compare a version only for equality with one you read (`atomic().check`). On SQLite two processes' versions are unique but not time-ordered.
+26. **`list({ prefix })` excludes the prefix key itself** (0.5). Read it with `get()`, or use `{ start: p, end: [...p, 0] }`-style ranges.
+27. **A `Date`/`bigint`/`Map` value read over kvs-server comes back as JSON** (ISO string, decimal string, `{}` or entries as `JSON.stringify` gives): the HTTP/WS API is JSON. Only the local store API keeps the types.
+28. **Do not write through kvs from inside your own `store.db.transaction()`** (`KVStore`): a version block reserved there would roll back with your transaction while the store keeps handing it out.
 
 ---
 
