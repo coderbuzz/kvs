@@ -1,10 +1,11 @@
-<!-- docs: sync from coderbuzz/codex@e61149f -->
+<!-- docs: sync from coderbuzz/codex@d1487ff -->
 
 # KVS: AI Agent Knowledge File
 
 **Package:** `@coderbuzz/kvs`
 **Purpose:** Multi-backend key-value store. Sync `KVStore` (bun:sqlite) and async `AsyncKVStore` (bun:sql, SQLite + PostgreSQL).
-**Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
+**Distribution:** ESM only (`dist/index.js` + one `.d.ts` per source file). `dist/index.js` is 115,093 bytes (24,433 gzip -9), unminified ES2022, no dependencies (kvs 0.6).
+**Runtime:** Bun ≥ 1.2.21 only (`engines.bun`). Measured: the full suite (415 tests, PostgreSQL included) passes on Bun 1.2.21, 1.3.0, 1.3.11 and 1.4.2; Bun 1.2.20 fails 137 tests with `Unsupported adapter: sqlite. Only "postgres" is supported for now` (`Bun.SQL` gained SQLite in 1.2.21). `dist/index.js` imports `bun:sqlite` and `bun` at top level, so it does not load on Node (`ERR_UNSUPPORTED_ESM_URL_SCHEME`) or Deno. From Node/Deno, run kvs-server on Bun and use `@coderbuzz/kvs-client`.
 
 ---
 
@@ -20,9 +21,10 @@ AsyncKVStore("postgres://...")  : async, bun:sql, PostgreSQL
 ```
 KVStore("kv.db")
   ├── get/set/delete          : CRUD (sync)
+  ├── getMany                 : up to 1000 keys, one snapshot (sync, 0.6)
   ├── increment               : atomic counter (sync)
-  ├── list                    : prefix/range queries (sync)
-  ├── atomic()                : version-checked transactions (sync)
+  ├── list                    : prefix/range queries, range inside a prefix (sync)
+  ├── atomic()                : version-checked transactions: check/set/delete/sum/enqueue (sync)
   ├── enqueue/dequeue         : persistent queue with leases (sync)
   ├── acknowledge/nack/extendLease(id, token)
   ├── listDead/retryDead/deleteDead, queueStats, cleanQueue
@@ -37,9 +39,10 @@ KVStore("kv.db")
 ```
 AsyncKVStore("sqlite://kv.db" | "postgres://...")
   ├── get/set/delete          : CRUD (async)
+  ├── getMany                 : up to 1000 keys in one statement (async, 0.6)
   ├── increment               : atomic counter (async)
-  ├── list                    : prefix/range queries (async)
-  ├── atomic()                : version-checked transactions (async commit)
+  ├── list                    : prefix/range queries, range inside a prefix (async)
+  ├── atomic()                : version-checked transactions incl. sum (async commit)
   ├── enqueue/dequeue/ack/nack, dead letters, stats : persistent queue (async)
   ├── watch()                 : same as KVStore (in-process; initial snapshot delivered async)
   ├── addQueueListener()      : same as KVStore
@@ -47,6 +50,27 @@ AsyncKVStore("sqlite://kv.db" | "postgres://...")
   ├── cleanExpired() / reset() : async
   └── close()                 : async
 ```
+
+---
+
+## Benchmarks
+
+`bench/throughput.bench.ts` (median of 5 runs; kvs 0.6, Bun 1.4.2, Intel Xeon 2.1 GHz with 4 vCPU, `:memory:` SQLite, PostgreSQL 16 in Docker on the same host; PostgreSQL only when `KVS_BENCH_PG` names a server you own, tables `kvsbench_*`). `delete()` removes an existing key per call; `increment()` calls `increment()` (the `kvs-throughput` suite of github.com/coderbuzz/benchmarks, whose latest results are for kvs 0.2.11 on Apple Silicon, measured `get` + `set` under that name).
+
+| Backend | set('k','v') | get() hit | get() miss | delete() | increment() | getMany(10 keys) | atomic().sum() |
+|---|---|---|---|---|---|---|---|
+| KVStore (bun:sqlite) | 388,424 ops/s | 618,121 ops/s | 1,078,434 ops/s | 451,968 ops/s | 125,737 ops/s | 42,916 ops/s | 103,971 ops/s |
+| AsyncKVStore (SQLite) | 56,011 ops/s | 69,605 ops/s | 68,773 ops/s | 74,343 ops/s | 21,620 ops/s | 16,220 ops/s | 20,846 ops/s |
+| AsyncKVStore (PostgreSQL) | 1,485 ops/s | 5,555 ops/s | 6,167 ops/s | 1,415 ops/s | 1,125 ops/s | 3,682 ops/s | 609 ops/s |
+
+- Every PostgreSQL call is a network round trip, every write a commit. PostgreSQL `atomic().sum()` also takes an advisory lock and `nextval()` in its transaction.
+- `getMany(10)` vs 10 awaited `get()` calls: SQLite `AsyncKVStore` 18K vs 7K calls/s; `KVStore` about equal (see `getMany`).
+- The hot-path micro-benchmark is `bench/core.bench.ts` (encode/decode, get, set, list, queue cycle, batch reads), used for before/after numbers of every optimization.
+- No claim against other stores is made: no benchmark in the benchmarks repo compares kvs with one.
+
+## Upgrading from 0.5
+
+No schema change (version 3), nothing to migrate. Behaviour changes: `list({ prefix, start | end })` works (0.5: `TypeError`); PostgreSQL `increment()` on a non-number throws `TypeError: kvs: increment() needs a number, but the key holds a non-numeric value` (0.5: the raw `PostgresError` 22P02/22021). `SqlAdapter` gains an optional `getMany` and an optional fourth `version` argument to `increment`; existing adapters keep working (`getMany()` then reads key by key; an `increment` that ignores `version` makes the summed key carry its own versionstamp instead of the commit's).
 
 ---
 
@@ -101,8 +125,11 @@ interface KvCheck {
                             // null   = "key must not exist"
 }
 
-interface KvMutation { type: "set" | "delete"; key: KvKey; value?: unknown; ttl?: number }
+// "sum" (0.6): value is the delta, a finite number; ttl applies to "set" only
+interface KvMutation { type: "set" | "delete" | "sum"; key: KvKey; value?: unknown; ttl?: number }
 
+// prefix alone: its children. start inclusive, end exclusive. With prefix (0.6),
+// start/end must be children of the prefix and narrow the range inside it.
 interface KvListSelector { prefix?: KvKey; start?: KvKey; end?: KvKey }
 interface KvListOptions { limit?: number; cursor?: string; reverse?: boolean }
 interface KvListResult { entries: KvEntry[]; cursor: string | null }
@@ -179,6 +206,10 @@ Encoding: each key part is a type-tag byte (`0x01` bytes, `0x02` string, `0x03` 
 Rules (KVS-10, kvs 0.5): `-0` is normalized to `0` (0.4 encoded it as eight `0x00` bytes and decoded it as `NaN`); `NaN` throws `TypeError: kvs: NaN cannot be a key part`; a bigint needs at most 255 magnitude bytes (`RangeError` beyond; 0.4 wrapped the length byte and wrote an undecodable key); any other part type (`null`, `undefined`, object, array, symbol) throws `TypeError` (0.4 wrote it as `true`/`false` by truthiness); a key that is not an array throws `TypeError`. The store refuses an encoded key longer than `maxKeySize` (default 2048) with `RangeError: kvs: key is N bytes encoded, over the 2048-byte limit (maxKeySize)`, on every call that takes a key (reads, writes, checks, list selectors). `encodeKey()` itself has no size limit.
 
 `list({ prefix: p })` reads `[enc(p) ‖ 0x01, enc(p) ‖ 0x07)`: exactly the keys with at least one more part after `p` (KVS-16). `enc(p)` ends with the `0x00` separator; the next byte of a child is its type tag 1..6, while the key `p` itself ends there and a string sibling `"p\0x"` continues with `0xff`. `prefix: []` gives `[0x01, 0x07)`, every key. kvs-server's scoped credentials use the same rule (`withinPrefix`: equal, or the prefix followed by a byte 1..6).
+
+With `prefix` plus `start`/`end` (0.6, as Deno KV), `start` replaces the lower bound `enc(p) ‖ 0x01` with `enc(start)` and `end` replaces the upper bound `enc(p) ‖ 0x07` with `enc(end)`. Each must be a child of `p` by the rule above (`enc(bound)` starts with `enc(p)` and the next byte is 1..6), otherwise `TypeError: kvs: list() start must be a key inside the prefix` (or `end`). So `["v"]`, the prefix key `["u"]` itself, the byte sibling `["u\0x"]`, `["uX", 1]` and `[]` are all refused for `prefix: ["u"]`, and the range can never leave the prefix: this is what keeps a kvs-server credential scoped to a prefix inside it. `start > end` gives an empty page.
+
+**Decoder (KVS-23, 0.6).** `decodeKey` scans each string/bytes part once to its unescaped `0x00` separator. A string part without escapes is decoded straight from a view of the row's bytes with one shared `TextDecoder`, or, when it is ASCII and at most 8 bytes, with `String.fromCharCode` (faster for short parts: 29M vs 8.7M decodes/s of `["k"]`; `TextDecoder` wins from ~13 bytes). A bytes part is always returned as a fresh copy (`slice`), never a view of the row buffer. Number parts go through one shared 8-byte scratch buffer instead of a new `ArrayBuffer` + `DataView` per part; `encodeKey` uses the same scratch and one shared `TextEncoder`. Measured on the same machine (Bun 1.4.2, `bench/core.bench.ts`, median of 3 runs, 0.5 → 0.6): `decodeKey(["users","alice",42])` 782K → 5.30M ops/s, `encodeKey` 2.87M → 4.65M, `KVStore.get` hit 551K → 679K (+23%), `list` 100 entries with number parts 4.5K → 10.2K, with string parts 5.2K → 5.9K (+14%). A first version (`indexOf` + a result object + `TextDecoder` for every string) made `get` hit 10% slower: short parts were slower than 0.5's copy loop.
 
 ```ts
 import { encodeKey, decodeKey, encodeKeyPrefix, prefixSuccessor } from "@coderbuzz/kvs";
@@ -268,6 +299,18 @@ const entry = store.get(["users", "alice"]);
 // null if missing or expired
 ```
 
+### `getMany(keys: KvKey[]): (KvEntry | null)[]`
+
+```ts
+const [a, missing, b] = store.getMany([["users", "a"], ["nope"], ["users", "b"]]);
+// [{ key, value, version }, null, { key, value, version }]
+```
+
+- One slot per key, in input order; `null` when absent or expired. A duplicate key gets its own slot and its own decoded copy of the value.
+- `keys` must be an array (`TypeError: kvs: getMany() takes an array of keys`), at most `1000` keys (`RangeError: kvs: getMany() reads at most 1000 keys, got N`). Every key is encoded and checked (part types, `maxKeySize`) before anything is read; `[]` returns `[]`.
+- `KVStore`: the reads run in one read transaction (`db.transaction()`, deferred) with one `now`, so they see one snapshot; a single key is a plain `get`. Measured: about the cost of N separate `get()` calls (10 keys: 36K vs 42K calls/s of 10 gets), so use it for the snapshot, not for speed. A single `IN (...)` statement was measured and was slower in-process (36–40K vs 43–47K), because of the map from rows back to slots.
+- `AsyncKVStore`: keys are deduplicated and read with the adapter's optional `getMany(keys, now)`, one `SELECT ... WHERE key IN (...) AND live` statement on both built-in adapters (one snapshot), then matched back to slots by key bytes. Measured on SQLite: 10 keys 18K calls/s vs 7K for 10 awaited `get()`s. An adapter without `getMany` is read key by key with `get()` (no snapshot guarantee).
+
 ### `set(key: KvKey, value: unknown, options?: { ttl?: number }): KvCommitResult`
 
 ```ts
@@ -300,7 +343,7 @@ Atomically increment a numeric value and return the new value. Default `delta: 1
 | key missing | created with `delta`, no TTL, `version` 1 |
 | key expired (row still present until cleanup) | treated as missing: value `delta`, TTL removed, `version` continues from the old row |
 | live number | `value + delta`; the key **keeps its TTL** |
-| live non-number (object, string, `null`, boolean) | throws `TypeError` (`KVStore`) or rejects (SQLite `AsyncKVStore`); PostgreSQL rejects with its own `invalid input syntax for type numeric` error. The value is left unchanged |
+| live non-number (object, string, `null`, boolean, typed value such as `Date`/`bigint`) | throws `TypeError: kvs: increment() needs a number, but the key holds <kind>` (`KVStore`, SQLite `AsyncKVStore`) or `TypeError: kvs: increment() needs a number, but the key holds a non-numeric value` (PostgreSQL, 0.6: the adapter maps the NUMERIC cast errors 22P02 and 22021; 0.5 rejected with PostgreSQL's own `invalid input syntax for type numeric`). The value is left unchanged. kvs-server answers 400 on every backend |
 | `delta` not a finite number | `RangeError`, nothing written |
 | result not finite (overflow) | `RangeError`, nothing written (SQLite backends) |
 
@@ -330,7 +373,9 @@ if (attempts > 10) throw new Error("Rate limit exceeded");
 
 ### `list(selector: KvListSelector, options?: KvListOptions): KvListResult`
 
-**Defaults:** `limit: 100`, max `1000`, ascending, `reverse: false`. `cursor` is opaque base64. `prefix` with `start` or `end` throws `TypeError: kvs: list() takes { prefix } or { start, end }, not both` (0.4 silently ignored `start`/`end`). Without `prefix`: `start` defaults to the empty key, `end` to `[0xff]`.
+**Defaults:** `limit: 100`, max `1000`, ascending, `reverse: false`. `cursor` is opaque base64. Without `prefix`: `start` defaults to the empty key, `end` to `[0xff]`.
+
+**`prefix` with `start`/`end`** (see "Key Encoding"): 0.4 silently ignored `start`/`end`, 0.5 threw `TypeError: kvs: list() takes { prefix } or { start, end }, not both`, 0.6 narrows the range inside the prefix (`start` inclusive, `end` exclusive, either or both) and throws `TypeError: kvs: list() start|end must be a key inside the prefix` for a bound that is not a child of the prefix. A cursor must fall inside the narrowed range, so a cursor from the whole prefix that points before `start` is a `RangeError`.
 
 **Validation:**
 - `limit` must be an integer ≥ 1, otherwise `RangeError` (`0`, negatives, `2.5`, `NaN`, `Infinity`). Values above 1000 are capped to 1000, not rejected.
@@ -345,6 +390,12 @@ store.list({ prefix: [] });
 
 // Range query
 store.list({ start: ["events", 1000], end: ["events", 2000] });
+
+// A range inside a prefix (0.6): September's orders, paged
+store.list({ prefix: ["orders"], start: ["orders", "2026-09"], end: ["orders", "2026-10"] }, { limit: 50 });
+store.list({ prefix: ["orders"], start: ["orders", "2026-09"] });      // from start to the end of the prefix
+store.list({ prefix: ["orders"], end: ["orders", "2026-01"] });        // from the prefix start to end
+store.list({ prefix: ["orders"], start: ["invoices"] });               // TypeError: start outside the prefix
 
 // Paginated
 const page1 = store.list({ prefix: ["logs"] }, { limit: 20 });
@@ -367,6 +418,7 @@ const result = store
   .check({ key: ["new-key"], version: null })     // fail if key exists
   .set(["counter"], 4)
   .set(["meta"], { updatedAt: Date.now() })
+  .sum(["stats", "updates"], 1)
   .delete(["old-key"])
   .enqueue({ task: "notify" }, { topic: "jobs" })
   .commit();
@@ -385,8 +437,22 @@ if (result.ok) {
 | `check` | `(...checks: KvCheck[]): this` | Assert key versions. `version: null` = "must not exist". `version: N` = "must be at version N". |
 | `set` | `(key, value, options?): this` | `options: { ttl?: number }` |
 | `delete` | `(key): this` | |
+| `sum` | `(key, delta: number): this` | Add `delta` to the number at `key` when the commit runs (0.6) |
 | `enqueue` | `(payload, options?): this` | `options: QueueOptions` |
 | `commit` | `(): KvCommitResult \| KvCommitError` | Execute all operations atomically. Returns `{ ok: false }` if any check fails, else `{ ok: true, version }` with the commit's one versionstamp. Once per builder. |
+
+**`sum(key, delta)` (0.6, Deno KV's `sum` for plain JS numbers).** Mutations run in the order they were added, so a `sum` sees the commit's earlier `set`/`delete`/`sum` of the same key (`set(k, 10).sum(k, 5).sum(k, 5)` → 20; `delete(k).sum(k, 3)` → 3).
+
+| Stored state at commit | Result |
+|---|---|
+| missing or expired | `delta`, no TTL |
+| live number | `value + delta`, TTL kept |
+| live non-number | `commit()` throws `TypeError: kvs: atomic().sum() needs a number, but the key holds <kind>` (PostgreSQL: `... holds a non-numeric value`); the whole commit is rolled back, enqueues included |
+| `delta` not a finite number (`NaN`, `Infinity`, a string, missing) | `RangeError: kvs: atomic().sum() delta must be a finite number, got X`, thrown before the transaction opens |
+| result not finite | `RangeError: kvs: atomic().sum() result is not a finite number` (SQLite backends) |
+| key checked `version: null` in the same commit | on PostgreSQL written with `insertIfAbsent(delta)`: a row a concurrent plain write created since the check makes the commit `{ ok: false }`, never a sum onto it |
+
+The summed key gets the commit's versionstamp and watchers see the new value. Implementation: `KVStore` reads `value, expires_at` inside the `IMMEDIATE` transaction and writes through the same upsert as `set`. `AsyncKVStore` calls the transaction adapter's `increment(key, delta, now, version)`: SQLite does the read-modify-write in the transaction; PostgreSQL runs its one-statement `INSERT ... ON CONFLICT DO UPDATE` NUMERIC upsert, which waits for and then adds to a concurrent uncommitted write (a read-then-write would have lost it; tested with a second connection holding the row lock). Unlike Deno KV there is no `min`/`max` and no `KvU64`: values are JS numbers, like `increment()`. Measured (`bench/throughput.bench.ts`): `KVStore` 104K commits/s, SQLite `AsyncKVStore` 21K, PostgreSQL 609.
 
 ### Queue model (0.4)
 
@@ -566,6 +632,7 @@ All methods return `Promise<T>`. Signatures mirror `KVStore` exactly:
 
 ```ts
 await store.get(key: KvKey): Promise<KvEntry | null>
+await store.getMany(keys: KvKey[]): Promise<(KvEntry | null)[]>          // max 1000 keys
 await store.set(key: KvKey, value: unknown, options?: { ttl?: number }): Promise<KvCommitResult>
 await store.delete(key: KvKey): Promise<void>
 await store.increment(key: KvKey, delta?: number): Promise<number>     // delta default: 1
@@ -608,7 +675,7 @@ const result = await store
   .commit();
 ```
 
-**AsyncAtomicOperation methods:** `check()`, `set()`, `delete()`, `enqueue()` all return `this`. `commit(): Promise<KvCommitResult | KvCommitError>`.
+**AsyncAtomicOperation methods:** `check()`, `set()`, `delete()`, `sum()`, `enqueue()` all return `this`. `commit(): Promise<KvCommitResult | KvCommitError>` (a `sum` on a non-number rejects with the `TypeError` above).
 
 ---
 
@@ -626,6 +693,8 @@ const result = await store
 | | `options.queue.deadRetention` | `Infinity` |
 | `set(key, value, options)` | `options` | `{}` (no TTL) |
 | `increment(key, delta)` | `delta` | `1` |
+| `getMany(keys)` | `keys.length` | max `1000` (`RangeError` beyond) |
+| `atomic().sum(key, delta)` | `delta` | required, finite number |
 | `list(selector, options)` | `options.limit` | `100` |
 | | `options.reverse` | `false` |
 | `enqueue(payload, options)` | `options.topic` | `"default"` |
@@ -659,6 +728,9 @@ interface KvRow { key: Uint8Array; value: Uint8Array; version: number }
 interface SqlAdapter {
   migrate(): Promise<void>;
   get(key: Uint8Array, now: number): Promise<KvRow | null>;          // live rows only
+  // Optional (0.6): the live rows among `keys` (deduplicated by the store), any order,
+  // in one statement. Without it getMany() calls get() per key.
+  getMany?(keys: Uint8Array[], now: number): Promise<KvRow[]>;
   // Without `version`: take the next versionstamp; with it: the one nextVersion()
   // returned for this atomic() commit (KVS-05)
   set(key: Uint8Array, value: Uint8Array, expiresAt: number | null, version?: number): Promise<{ version: number }>;
@@ -666,9 +738,11 @@ interface SqlAdapter {
   delete(key: Uint8Array): Promise<boolean>;
   getVersion(key: Uint8Array, now: number): Promise<number | null>;
   // Must create a missing/expired key with `delta` (no TTL), keep a live key's TTL,
-  // and throw on a non-numeric value. Returning null = legacy "key missing" (store
-  // then does a non-atomic set()).
-  increment(key: Uint8Array, delta: number, now?: number): Promise<{ val: number; version: number } | null>;
+  // and throw on a non-numeric value (a TypeError starting "kvs: increment() " is
+  // reworded for atomic().sum()). Returning null = legacy "key missing" (store then
+  // does a non-atomic set(); atomic().sum() throws instead). `version` (0.6): given by
+  // atomic().sum() on the transaction adapter, the commit's versionstamp to write.
+  increment(key: Uint8Array, delta: number, now?: number, version?: number): Promise<{ val: number; version: number } | null>;
   listAsc(start: Uint8Array, end: Uint8Array, now: number, limit: number): Promise<KvRow[]>;
   listDesc(start: Uint8Array, end: Uint8Array, now: number, limit: number): Promise<KvRow[]>;
   cleanExpired(now: number): Promise<number>;
@@ -706,7 +780,7 @@ interface QueueRow {
 
 `migrate()` must implement "Schema versions" above (create or upgrade, verify columns, refuse a newer version). 0.3 adapters (`dequeue(topic, now, limit)`, `ack(id)`, `requeueFailed`) no longer compile against 0.4.
 
-`atomic().commit()` inside `transaction()`: `lockKeys(checked ∪ mutated keys)` → each check via `getVersionForUpdate ?? getVersion` → each `set` via `insertIfAbsent` when its key was checked `version: null` (null result = `{ ok: false }`), otherwise `set` → deletes → enqueues.
+`atomic().commit()` inside `transaction()`: `lockKeys(checked ∪ mutated keys)` → each check via `getVersionForUpdate ?? getVersion` → `nextVersion()` → mutations in order: a `set` via `insertIfAbsent` when its key was checked `version: null` (null result = `{ ok: false }`), otherwise `set`; a `sum` via `insertIfAbsent(delta)` in that same case, otherwise `increment(key, delta, now, version)`; a `delete` via `delete` → enqueues.
 
 ### SQL Dialect Differences
 
@@ -716,7 +790,8 @@ interface QueueRow {
 | Queue ID | `INTEGER PRIMARY KEY AUTOINCREMENT` | `SERIAL` in step 1, `BIGINT` + `AS BIGINT` sequence in step 2 |
 | Entry `version` | `INTEGER` (64-bit) | `BIGINT` (step 2); Bun.SQL returns int8 as string, the adapter applies `Number()` |
 | Timestamp | `INTEGER` | `BIGINT` |
-| `increment()` | read-modify-write in one transaction (JS arithmetic) | one upsert, `convert_from(value,'UTF8')::numeric + delta`, returned as `FLOAT8` |
+| `increment()`, `atomic().sum()` | read-modify-write in one transaction (JS arithmetic) | one upsert, `convert_from(value,'UTF8')::numeric + delta`, returned as `FLOAT8`; errors 22P02/22021 (not a JSON number) become the kvs `TypeError` |
+| `getMany()` | `KVStore`: one read transaction of point reads; `SQLiteAsyncAdapter`: `SELECT ... WHERE key IN (?, …) AND (expires_at IS NULL OR expires_at > ?)` | `SELECT ... WHERE key IN ($1, …) AND (expires_at IS NULL OR expires_at > $n+1)` |
 | `atomic()` concurrency | serial queue: one statement or transaction at a time | `pg_advisory_xact_lock` per key, `SELECT ... FOR UPDATE` for checks, `insertIfAbsent` for `version: null` keys |
 | Concurrent dequeue | `MATERIALIZED` CTE picker (writers serialized) | `MATERIALIZED` CTE picker with `FOR UPDATE SKIP LOCKED` |
 | Lease reclaim | one UPDATE | `MATERIALIZED` CTE with `FOR UPDATE SKIP LOCKED`, then UPDATE ... FROM |
@@ -817,7 +892,7 @@ sf.size;           // number of in-flight keys
 3. `watch()` fires immediately with current values, not just on future changes.
 4. `addQueueListener()` handlers are awaited and **auto-acked** (resolve) or **nacked** (throw) since 0.4. Do not also call `acknowledge()` from an `autoAck` handler (the second ack returns `false` and counts `leaseLost`). Use `autoAck: false` to own the message.
 5. `getAsync()` uses the hex of the encoded key as the singleflight dedup key, so keys that encode identically share one flight. Dedup is per store instance (in-process only).
-6. `KVStore` requires Bun (for `bun:sqlite`). `AsyncKVStore` uses `bun:sql` (built-in, no extra deps).
+6. **Bun ≥ 1.2.21 only** (`engines.bun`, 0.6). `KVStore` uses `bun:sqlite`, `AsyncKVStore` `Bun.SQL` (SQLite there since Bun 1.2.21). The package does not load on Node or Deno; use `@coderbuzz/kvs-client` against a kvs-server running on Bun.
 7. `close()` stops all timers, cancels all watchers, and closes the database. No operations work after close.
 8. SQLite WAL means concurrent readers are fine, but writers are serialized.
 9. **Engine minimums:** the queue picker is a `WITH ... AS MATERIALIZED` CTE, which requires **PostgreSQL 12+** and **SQLite 3.35+**; `RETURNING` also requires SQLite 3.35+. Bun 1.4 bundles SQLite 3.53, so only the PostgreSQL server version needs checking.
@@ -826,9 +901,9 @@ sf.size;           // number of in-flight keys
 12. `new AsyncKVStore("kv.db")` does not open SQLite. Bun's `SQL` treats a protocol-less filename as PostgreSQL. Use `"sqlite://kv.db"`.
 13. Watch `sequence` starts at 0 per store instance and increments per committed batch (including batches no watcher matches). It is not persisted.
 14. `KvWatchEvent.coalesced` is declared but never set by the core store, and `@coderbuzz/kvs-server` does not send it. Treat it as reserved.
-15. **Validation errors are `RangeError`/`TypeError`:** `list()` limit/cursor, `ttl`, queue `delay` (must be finite; negative means already due), and `increment()` delta throw `RangeError`; `increment()` on a non-number throws `TypeError`. On `AsyncKVStore` they reject the returned promise. Validation happens before any write.
+15. **Validation errors are `RangeError`/`TypeError`:** `list()` limit/cursor, `ttl`, queue `delay` (must be finite; negative means already due), `increment()`/`atomic().sum()` delta and `getMany()` over 1000 keys throw `RangeError`; `increment()`/`sum` on a non-number, a `list()` bound outside its prefix and a non-array `getMany()` argument throw `TypeError`. All start with `kvs: `, which is how kvs-server tells them apart (400). On `AsyncKVStore` they reject the returned promise. Validation happens before any write.
 16. **`atomic().commit()` is safe under concurrency on every backend.** Two commits that check the same `version` (or `version: null`) never both return `ok: true`, including write skew (A checks B absent and writes A, B checks A absent and writes B: exactly one wins). On PostgreSQL a check waits for an uncommitted write to the checked row and then re-reads it; a `version: null` key that a concurrent plain `set()` creates before the commit makes the commit return `{ ok: false }`.
-17. **Custom `SqlAdapter` on a concurrent backend** must implement `lockKeys`, `getVersionForUpdate` and `insertIfAbsent` for 16 to hold; without them `atomic()` falls back to plain `getVersion()` + `set()`. Its `increment(key, delta, now)` must create missing/expired keys itself; returning `null` (the pre-0.3.2 contract) makes the store fall back to a non-atomic `set()`.
+17. **Custom `SqlAdapter` on a concurrent backend** must implement `lockKeys`, `getVersionForUpdate` and `insertIfAbsent` for 16 to hold; without them `atomic()` falls back to plain `getVersion()` + `set()`. Its `increment(key, delta, now, version?)` must create missing/expired keys itself and, when called with `version` (by `atomic().sum()`), write that versionstamp; returning `null` (the pre-0.3.2 contract) makes the store fall back to a non-atomic `set()`, and makes `atomic().sum()` throw.
 18. **Do not call a `SQLiteAsyncAdapter` from inside its own `transaction()` callback** except through the adapter the callback receives: the outer adapter waits for the transaction to finish, so the call never completes.
 19. **`acknowledge`/`nack`/`extendLease` need `msg.token`.** A 0.3-style `acknowledge(id)` throws `TypeError`.
 20. **A message is at-least-once.** A handler slower than its lease (without renewal: `autoAck: false`, or a plain `dequeue()` loop) can see its message redelivered to another consumer; its late `acknowledge` then returns `false`.
@@ -840,6 +915,9 @@ sf.size;           // number of in-flight keys
 26. **`list({ prefix })` excludes the prefix key itself** (0.5). Read it with `get()`, or use `{ start: p, end: [...p, 0] }`-style ranges.
 27. **A `Date`/`bigint`/`Map` value read over kvs-server comes back as JSON** (ISO string, decimal string, `{}` or entries as `JSON.stringify` gives): the HTTP/WS API is JSON. Only the local store API keeps the types.
 28. **Do not write through kvs from inside your own `store.db.transaction()`** (`KVStore`): a version block reserved there would roll back with your transaction while the store keeps handing it out.
+29. **`atomic().sum()` returns no value.** The commit result is `{ ok, version }`, as in Deno KV. Read the counter afterwards, or use `increment()` (outside a commit) when you need the new number back. `sum` and `increment()` share semantics: same TTL rules, same errors, same PostgreSQL NUMERIC arithmetic.
+30. **`getMany()` is at most 1000 keys and returns `null` slots**, not `{ value: null, versionstamp: null }` entries as Deno KV does. On `KVStore` it is no faster than a loop of `get()`; its point is one snapshot. For more keys, split the call (each call is its own snapshot) or use `list()` over a range.
+31. **In `list({ prefix, start, end })` the bounds are keys inside the prefix, not suffixes**: `{ prefix: ["orders"], start: ["orders", 5] }`, not `start: [5]` (a `TypeError`, because `[5]` is outside `["orders"]`). The prefix key itself is not a valid bound either.
 
 ---
 
