@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@d1487ff -->
+<!-- docs: sync from coderbuzz/codex@8854676 -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -33,15 +33,17 @@ KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **P
 
 ## Benchmarks
 
-Measured with `bench/throughput.bench.ts` in this repository (median of 5 runs; kvs 0.6, Bun 1.4.2, Intel Xeon 2.1 GHz with 4 vCPU, `:memory:` SQLite, PostgreSQL 16 in Docker on the same host). Numbers from another machine are not comparable; rerun the script there.
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud reference machine (Intel Xeon @ 2.10GHz, CPU model 207, 4 cores, Linux x64), Bun 1.4.2, run of 2026-10-10 (benchmarks `131fcc5`). kvs 0.6.0, one caller, sequential; `:memory:` SQLite and PostgreSQL 16 on the same machine. ops/s, best of 3 processes, higher is better.
 
-| Backend | set('k','v') | get() hit | get() miss | delete() | increment() | getMany(10 keys) | atomic().sum() |
-|---|---|---|---|---|---|---|---|
-| KVStore (bun:sqlite) | 388,424 ops/s | 618,121 ops/s | 1,078,434 ops/s | 451,968 ops/s | 125,737 ops/s | 42,916 ops/s | 103,971 ops/s |
-| AsyncKVStore (SQLite) | 56,011 ops/s | 69,605 ops/s | 68,773 ops/s | 74,343 ops/s | 21,620 ops/s | 16,220 ops/s | 20,846 ops/s |
-| AsyncKVStore (PostgreSQL) | 1,485 ops/s | 5,555 ops/s | 6,167 ops/s | 1,415 ops/s | 1,125 ops/s | 3,682 ops/s | 609 ops/s |
+| Backend | set('k','v') | get() hit | get() miss | delete() | increment() |
+|---|---|---|---|---|---|
+| KVStore (bun:sqlite) | **487,518** | **820,397** | **1,678,310** | **625,044** | **165,933** |
+| AsyncKVStore (SQLite) | 71,638 | 92,384 | 106,287 | 98,701 | 28,381 |
+| AsyncKVStore (PostgreSQL) | 4,039 | 15,227 | 17,152 | 5,041 | 4,790 |
 
-Every PostgreSQL call is a network round trip (and each write a commit), which is what the lower numbers pay for multi-process access. On `AsyncKVStore`, one `getMany()` of 10 keys takes about the time of 2.5 separate `get()` calls on SQLite; on `KVStore` it costs about the same as 10 `get()` calls and buys one consistent snapshot. kvs makes no speed claim against other stores: the suite at [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) measures kvs alone, and its current results are for kvs 0.2.11.
+Every PostgreSQL call is a network round trip (and each write a commit), which is what the lower numbers pay for multi-process access. `increment()` is the store's atomic built-in. kvs makes no speed claim against other stores: the public suite measures kvs alone. On `AsyncKVStore`, one `getMany()` of 10 keys is much cheaper than 10 separate `get()` calls; on `KVStore` it costs about the same and buys one consistent snapshot.
+
+> Numbers move with the machine; compare them only within one run. The source of truth is `https://raw.githubusercontent.com/coderbuzz/benchmarks/main/results/latest.json`.
 
 ---
 
