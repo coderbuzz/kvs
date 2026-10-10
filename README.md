@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@8854676 -->
+<!-- docs: sync from coderbuzz/codex@5aee801 -->
 
 # KVS: `@coderbuzz/kvs`
 
@@ -33,13 +33,13 @@ KVS is an embeddable key-value store backed by **SQLite** (sync or async) or **P
 
 ## Benchmarks
 
-Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud reference machine (Intel Xeon @ 2.10GHz, CPU model 207, 4 cores, Linux x64), Bun 1.4.2, run of 2026-10-10 (benchmarks `131fcc5`). kvs 0.6.0, one caller, sequential; `:memory:` SQLite and PostgreSQL 16 on the same machine. ops/s, best of 3 processes, higher is better.
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): reference VM (Intel Xeon Platinum 8255C @ 2.50GHz, 4 cores, Linux x64; PostgreSQL 16 in Docker on the same VM), Bun 1.4.3, run of 2026-10-10 (benchmarks `6ed4ccf`). kvs 0.6.0, one caller, sequential; `:memory:` SQLite and PostgreSQL 16 in Docker on the same VM. ops/s, best of 3 processes, higher is better.
 
 | Backend | set('k','v') | get() hit | get() miss | delete() | increment() |
 |---|---|---|---|---|---|
-| KVStore (bun:sqlite) | **487,518** | **820,397** | **1,678,310** | **625,044** | **165,933** |
-| AsyncKVStore (SQLite) | 71,638 | 92,384 | 106,287 | 98,701 | 28,381 |
-| AsyncKVStore (PostgreSQL) | 4,039 | 15,227 | 17,152 | 5,041 | 4,790 |
+| KVStore (bun:sqlite) | **348,304** | **632,717** | **1,243,984** | **441,977** | **124,896** |
+| AsyncKVStore (SQLite) | 45,223 | 55,942 | 62,062 | 45,977 | 16,100 |
+| AsyncKVStore (PostgreSQL) | 1,270 | 3,996 | 4,415 | 1,316 | 1,223 |
 
 Every PostgreSQL call is a network round trip (and each write a commit), which is what the lower numbers pay for multi-process access. `increment()` is the store's atomic built-in. kvs makes no speed claim against other stores: the public suite measures kvs alone. On `AsyncKVStore`, one `getMany()` of 10 keys is much cheaper than 10 separate `get()` calls; on `KVStore` it costs about the same and buys one consistent snapshot.
 
