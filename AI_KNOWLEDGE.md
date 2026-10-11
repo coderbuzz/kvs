@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@aa9c4da -->
+<!-- docs: sync from coderbuzz/codex@956f0b5 -->
 
 # KVS: AI Agent Knowledge File
 
@@ -57,13 +57,13 @@ AsyncKVStore("sqlite://kv.db" | "postgres://...")
 
 Source of truth: `https://raw.githubusercontent.com/coderbuzz/benchmarks/main/results/latest.json` (suite ids `kvs-set`, `kvs-get-hit`, `kvs-get-miss`, `kvs-delete`, `kvs-increment`); quote speed from there only.
 
-Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud machine (Intel Xeon @ 2.80GHz, family 6 model 85 stepping 7, 4 cores, Linux x64; PostgreSQL 16 on the same machine), Bun 1.4.3, run of 2026-10-10 (benchmarks `f9601b4`). kvs 0.6.0, one caller, sequential; `:memory:` SQLite and PostgreSQL 16 on the same machine. ops/s, best of 3 processes, higher is better.
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud machine (Intel Xeon @ 2.10GHz, family 6 model 207 stepping 2, 4 cores, Linux x64; PostgreSQL 16 on the same machine), Bun 1.4.3, run of 2026-10-10 (benchmarks `31fbcee`). kvs 0.6.0, one caller, sequential; `:memory:` SQLite and PostgreSQL 16 on the same machine. ops/s, best of 3 processes, higher is better.
 
 | Backend | set('k','v') | get() hit | get() miss | delete() | increment() |
 |---|---|---|---|---|---|
-| KVStore (bun:sqlite) | **365,937** | **582,139** | **1,259,964** | **480,161** | **121,395** |
-| AsyncKVStore (SQLite) | 50,889 | 66,637 | 73,679 | 62,647 | 17,368 |
-| AsyncKVStore (PostgreSQL) | 2,941 | 9,191 | 10,371 | 3,027 | 2,648 |
+| KVStore (bun:sqlite) | **496,026** | **816,544** | **1,637,397** | **642,858** | **149,381** |
+| AsyncKVStore (SQLite) | 67,638 | 81,345 | 88,147 | 85,164 | 24,823 |
+| AsyncKVStore (PostgreSQL) | 3,130 | 13,953 | 14,074 | 3,206 | 2,909 |
 
 - Every PostgreSQL call is a network round trip, every write a commit. PostgreSQL `atomic().sum()` also takes an advisory lock and `nextval()` in its transaction.
 - `getMany()` and `atomic().sum()` are not in the public suite. Locally, one `getMany(10)` on SQLite `AsyncKVStore` replaces about 2.5 awaited `get()` calls; on `KVStore` it is about equal to the loop (see `getMany`).
